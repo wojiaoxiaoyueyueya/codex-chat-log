@@ -1,7 +1,7 @@
 ﻿$ErrorActionPreference = 'Stop'
 & (Join-Path $PSScriptRoot 'build.ps1')
 $taskRelease = Join-Path $PSScriptRoot '发布包'
-$taskZip = Join-Path $taskRelease 'codex智入-1.3.0-Windows-x64.zip'
+$taskZip = Join-Path $taskRelease 'codex-zhiru-1.3.0-Windows-x64.zip'
 if (Test-Path -LiteralPath $taskZip) {
     throw 'Release destination exists. Preserve or move the previous release before packaging again.'
 }

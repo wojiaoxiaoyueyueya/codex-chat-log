@@ -8,7 +8,7 @@
 
 ## 下载和运行
 
-建议从 [Releases](https://github.com/wojiaoxiaoyueyueya/codex-chat-log/releases/latest) 下载完整的 `codex智入-1.3.0-Windows-x64.zip`，解压后双击 `codex智入.exe`。
+建议从 [Releases](https://github.com/wojiaoxiaoyueyueya/codex-chat-log/releases/latest) 下载完整的 `codex-zhiru-1.3.0-Windows-x64.zip`，解压后双击 `codex智入.exe`。下载文件名使用英文，解压后的程序和界面保持中文。
 
 也可以在仓库主页选择 **Code → Download ZIP**，解压完整目录后运行根目录的 exe。
 
