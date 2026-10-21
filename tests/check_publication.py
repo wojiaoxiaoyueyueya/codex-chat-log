@@ -10,6 +10,8 @@ import zipfile
 ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = 'vendor/python-3.11.9-embed-amd64.zip'
 RUNTIME_SHA = '009d6bf7e3b2ddca3d784fa09f90fe54336d5b60f0e0f305c37f400bf83cfd3b'
+ZSTD = 'vendor/zstd-v1.5.7-win64.zip'
+ZSTD_SHA = 'acb4e8111511749dc7a3ebedca9b04190e37a17afeb73f55d4425dbf0b90fad9'
 ALLOWED = {
     '.gitignore', '.gitattributes', 'README.md', 'KNOWN_ISSUES.md', 'SECURITY.md',
     'THIRD_PARTY_NOTICES.md', '使用说明.txt', 'build.ps1', 'package.ps1', 'codex智入.exe', RUNTIME,
@@ -20,8 +22,12 @@ ALLOWED = {
     'tests/test_offline.py', 'tests/UiChecks.cs', 'tests/GracefulWindow.cs',
     'tests/test_graceful_native.py', 'tests/benchmark.py', 'tests/run-ui.ps1',
     'tests/run-data.ps1', 'tests/check_publication.py',
+    'diagnose.cmd', 'diagnose.ps1', 'src/chat_diagnostics.py',
+    'lib/session_io.py', 'tests/test_session_io.py', ZSTD, 'vendor/zstd-LICENSE.txt',
 }
 PORTABLE = {'codex智入.exe', '使用说明.txt', RUNTIME,
+            'THIRD_PARTY_NOTICES.md', 'lib/session_io.py', ZSTD, 'vendor/zstd-LICENSE.txt',
+            'README.md', 'KNOWN_ISSUES.md', 'diagnose.cmd', 'diagnose.ps1', 'src/chat_diagnostics.py',
             'src/offline.py', 'src/win_process.py', 'src/sidebar.py', 'src/asset_conflicts.py',
             'lib/chat_merge.py', 'lib/chat_select.py', 'lib/chat_snapshot.py'}
 SECRET = re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9]{30,255}|github_pat_[A-Za-z0-9_]{30,255}|'
@@ -39,8 +45,11 @@ def digest(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--release', type=Path)
+    parser.add_argument('--working-tree', action='store_true', help='Validate the reviewable working copy, including new files, without staging')
     args = parser.parse_args()
-    process = subprocess.run(['git', '-C', str(ROOT), 'ls-files', '-z'], capture_output=True, check=True)
+    command = ['git', '-C', str(ROOT), 'ls-files', '-z']
+    if args.working_tree: command += ['--cached', '--others', '--exclude-standard']
+    process = subprocess.run(command, capture_output=True, check=True)
     names = [name for name in process.stdout.decode('utf-8').split('\0') if name]
     if not names: raise ValueError('No tracked publication files. Stage explicit approved files first.')
     if set(names) != ALLOWED: raise ValueError('Tracked file list differs from the complete publication allowlist.')
@@ -48,8 +57,9 @@ def main():
         path = ROOT / name
         if name not in ALLOWED or path.is_symlink() or ROOT not in path.resolve().parents:
             raise ValueError('Unexpected public path: ' + name)
-        staged = subprocess.run(['git', '-C', str(ROOT), 'show', ':' + name], capture_output=True, check=True).stdout
-        if name in ('codex智入.exe', RUNTIME):
+        staged = path.read_bytes() if args.working_tree else subprocess.run(
+            ['git', '-C', str(ROOT), 'show', ':' + name], capture_output=True, check=True).stdout
+        if name in ('codex智入.exe', RUNTIME, ZSTD):
             if hashlib.sha256(staged).hexdigest() != digest(path):
                 raise ValueError('Staged binary differs: ' + name)
             continue
@@ -59,6 +69,7 @@ def main():
         if SECRET.search(text) or re.search(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----', text):
             raise ValueError('Potential secret in: ' + name)
     if digest(ROOT / RUNTIME) != RUNTIME_SHA: raise ValueError('Official embedded runtime hash differs.')
+    if digest(ROOT / ZSTD) != ZSTD_SHA: raise ValueError('Official Zstandard runtime hash differs.')
     if not (ROOT / 'codex智入.exe').read_bytes().startswith(b'MZ'): raise ValueError('Application binary missing.')
     if args.release:
         with zipfile.ZipFile(args.release) as archive:

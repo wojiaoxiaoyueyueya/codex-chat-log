@@ -28,7 +28,7 @@ import win_process
 import sidebar
 import asset_conflicts
 
-VERSION = '1.3.0'
+VERSION = '1.3.5'
 FORMAT = 'codex-zhiru-offline'
 CACHE = Path(os.environ.get('LOCALAPPDATA', tempfile.gettempdir())) / 'CodexZhiru' / 'jobs'
 RUNTIME_SHA = '009d6bf7e3b2ddca3d784fa09f90fe54336d5b60f0e0f305c37f400bf83cfd3b'
@@ -141,27 +141,44 @@ def safe_title(value, fallback):
 
 
 def read_state(home, work=None):
-    # A short readonly transaction includes committed WAL data without copying
-    # and integrity-scanning an entire database for every list or click.
-    db = m.db_open(home / m.DBS[0])
-    db.row_factory = sqlite3.Row
-    try:
-        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        threads = [dict(row) for row in db.execute('SELECT * FROM threads')]
-        projects = {r['id']: dict(r) for r in db.execute('SELECT * FROM projects')} if 'projects' in tables else {}
-        edges = {r['child_thread_id']: r['parent_thread_id'] for r in db.execute('SELECT * FROM thread_spawn_edges')} if 'thread_spawn_edges' in tables else {}
-        roots = [dict(r) for r in db.execute('SELECT * FROM project_roots')] if 'project_roots' in tables else []
-        sections = {r['id']: dict(r) for r in db.execute('SELECT * FROM thread_sections')} if 'thread_sections' in tables else {}
-        return threads, projects, edges, roots, sections
-    finally:
-        db.close()
+    # Even SQLite mode=ro may create/update a source WAL/SHM. Open only a
+    # short-lived file copy, including committed WAL pages, for every read.
+    root = CACHE.parent / 'metadata-readers'
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='read-', dir=root) as temporary:
+        copy = Path(temporary)
+        names = (m.DBS[0], m.DBS[0] + '-wal')
+        for attempt in range(3):
+            before = m.tree_signature(home, names)
+            try:
+                for name in names:
+                    source, destination = home / name, copy / name
+                    if source.exists():
+                        shutil.copyfile(source, destination)
+                    elif destination.exists():
+                        destination.unlink()
+            except FileNotFoundError:
+                continue
+            if m.tree_signature(home, names) == before:
+                break
+        else:
+            raise RuntimeError('聊天数据库仍在更新，请稍后刷新，或正常退出 Codex 后重试。')
+        with contextlib.closing(m.db_open(copy / m.DBS[0])) as db:
+            db.row_factory = sqlite3.Row
+            tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            threads = [dict(row) for row in db.execute('SELECT * FROM threads')]
+            projects = {r['id']: dict(r) for r in db.execute('SELECT * FROM projects')} if 'projects' in tables else {}
+            edges = {r['child_thread_id']: r['parent_thread_id'] for r in db.execute('SELECT * FROM thread_spawn_edges')} if 'thread_spawn_edges' in tables else {}
+            roots = [dict(r) for r in db.execute('SELECT * FROM project_roots')] if 'project_roots' in tables else []
+            sections = {r['id']: dict(r) for r in db.execute('SELECT * FROM thread_sections')} if 'thread_sections' in tables else {}
+            return threads, projects, edges, roots, sections
 
 
 def segments(home):
     result = {}
     for directory in m.DIRS[:2]:
         for path in m.safe_files(home / directory):
-            if path.suffix != '.jsonl':
+            if not m.is_transcript(path) or not m.preferred(path):
                 continue
             sid = m.session_storage_id(path)
             if sid in result:
@@ -200,7 +217,10 @@ def list_chats(home, *, snapshot_home=None):
             entry = storage.get(head)
             meta = entry['meta'] if entry else {}
             project = projects.get(row.get('project_id'), {})
-            parent = meta.get('forked_from_id') or meta.get('parent_thread_id') or edges.get(sid)
+            source = sidebar.object_value(meta.get('source')) or sidebar.object_value(row.get('source'))
+            subagent = sidebar.object_value(source.get('subagent'))
+            spawn = sidebar.object_value(subagent.get('thread_spawn'))
+            parent = edges.get(sid) or meta.get('parent_thread_id') or spawn.get('parent_thread_id') or row.get('parent_thread_id') or meta.get('forked_from_id')
             if not parent and meta.get('history_base'):
                 ancestor = storage.get(meta['history_base']['thread_id'], {}).get('meta', {})
                 owner = ancestor.get('id') or ancestor.get('session_id')
@@ -212,6 +232,8 @@ def list_chats(home, *, snapshot_home=None):
                            'project': safe_title(project.get('name'), '未分组聊天'),
                            'parent_id': parent or '', 'archived': bool(row.get('archived')),
                            'available': entry is not None, 'head': head,
+                           'helper': bool(source.get('subagent') or meta.get('agent_nickname')),
+                           'guardian': subagent.get('other') == 'guardian',
                            'updated_at': row.get('updated_at_ms') or int(row.get('updated_at', 0) or 0) * 1000})
         gpath = metadata_home / '.codex-global-state.json'
         global_state = m.read_json(gpath) if gpath.exists() else {}
@@ -233,7 +255,7 @@ def iter_history(storage, sid, cut=None, seen=None):
         raise RuntimeError('聊天历史边界不正确。')
     if base:
         yield from iter_history(storage, base['thread_id'], start, seen)
-    with entry['path'].open('rb') as stream:
+    with m.open_transcript(entry['path']) as stream:
         for n, raw in enumerate(stream):
             if cut is not None and start + n >= cut:
                 break
@@ -310,6 +332,21 @@ def signature(home):
     return [list(x) for x in m.tree_signature(home, m.managed_names(home))] if home.exists() else []
 
 
+def import_signature(home):
+    # SHM is a transient reader/lock index, never a chat content baseline.
+    return [entry for entry in signature(home) if not any(entry[0] == name + '-shm' for name in m.DBS)]
+
+
+def preview_path(work, job, kind):
+    name = job.get(kind + '_dir', kind)
+    if kind not in ('current', 'pack') or not re.fullmatch(kind + r'(?:-[0-9a-f]{12})?', str(name)):
+        raise ValueError('核对副本路径无效，请重新选择备份。')
+    path = work / name
+    if path.resolve().parent != work.resolve():
+        raise ValueError('核对副本路径不安全。')
+    return path
+
+
 def check_export_source(home, before, phase):
     after = signature(home)
     if after == before:
@@ -384,7 +421,7 @@ def prepare_readers(home, archive_home=None, auto_close=True):
             m.write_json(destination / state.name, m.filter_global_state(m.read_json(state)) if state.exists() else {})
             for directory in m.DIRS[:2]:
                 for path in m.safe_files(source / directory):
-                    if path.suffix != '.jsonl': continue
+                    if not m.is_transcript(path): continue
                     target = destination / path.relative_to(source)
                     target.parent.mkdir(parents=True, exist_ok=True)
                     try: os.link(path, target)
@@ -573,54 +610,172 @@ def preview_import(bundle, home, auto_close=True):
         bundle_meta = verify_bundle(Path(bundle), work / 'data')
         incoming = selection.prepare_package(work / 'data', home, work / 'pack')
         current = work / 'current'
-        before = signature(home)
+        before = import_signature(home)
         if (home / m.DBS[0]).exists():
             # Baseline files are only read, never edited. The final merged stage
             # uses independent copies, so a hardlink cannot overwrite live data.
             m.take_current(home, current, link_assets=True)
         else:
             empty_baseline(incoming, current)
-        if signature(home) != before:
+        if import_signature(home) != before:
             raise RuntimeError('核对期间本机聊天发生变化，请关闭 Codex 后重试。')
         progress('按消息内容核对新旧，不使用电脑时间判断覆盖。')
         source_catalog = m.read_json(work / 'pack' / 'package.json').get('prepared_catalog') or selection.catalog(incoming)
         destination_catalog = selection.catalog(current)
         states = selection.classify(source_catalog, destination_catalog)
-        selected = [sid for sid, state in states.items() if state in ('new', 'newer')]
-        safe, required, blocked = selection.history_selection(incoming, current, home, selected, states)
-        schema = m.schema_compatibility(incoming, current) if safe else {'supported': True, 'differences': [], 'reason': ''}
-        if not schema['supported']: safe = set()
         names = {r['id']: r for r in list_chats(incoming)['chats']}
-        # Persist complete readable names for instant conversation lookup and
-        # correct context when a change belongs to an internal child chat.
         m.write_json(work / 'chat-names.json', names)
-        labels = {'new': '新增聊天', 'newer': '备份有新增对话', 'conflict': '双方历史不同，保留本机',
-                  'same': '相同，跳过', 'older': '本机更新，跳过'}
-        changes = []
-        for sid, state in states.items():
-            if state in ('same', 'older'):
-                continue
-            row = dict(names[sid])
-            row.update(status=state, reason=labels[state], selectable=sid in safe,
-                       source_records=len(source_catalog[sid]['events']),
-                       local_records=len(destination_catalog.get(sid, {}).get('events', [])))
-            if sid in blocked:
-                parent = blocked[sid]['parent_id']
-                row['reason'] = '共享历史无法安全复用；父聊天：' + names.get(parent, {}).get('title', parent)
-            if not schema['supported'] and state in ('new', 'newer'): row['reason'] = schema['reason']
-            changes.append(row)
-        changes.sort(key=lambda r: (r.get('group_rank', 0), r.get('helper', False), r.get('sort_order', 0)))
         job = {'home': str(home), 'signature': before, 'credential_hashes': m.credential_hashes(home),
-               'states': states, 'selected': sorted(safe), 'created_at': time.time(), 'used': False}
-        m.write_json(work / 'job.json', job)
-        return {'token': work.name, 'home': str(home), 'archive_home': str(incoming), 'changes': changes,
-                'source_chats': len(source_catalog), 'local_chats': len(destination_catalog),
-                'same': list(states.values()).count('same'), 'local_newer': list(states.values()).count('older'),
-                'safe': len(safe), 'blocked': len(blocked), 'conflicts': list(states.values()).count('conflict'),
-                'schema': schema,
-                'created_at': bundle_meta['created_at'], 'new_profile': not (home / m.DBS[0]).exists()}
+               'states': states, 'created_at': time.time(), 'used': False,
+               'source_records': {sid: len(entry['events']) for sid, entry in source_catalog.items()},
+               'local_records': {sid: len(entry['events']) for sid, entry in destination_catalog.items()},
+               'source_chats': len(source_catalog), 'local_chats': len(destination_catalog),
+               'bundle_created_at': bundle_meta['created_at'], 'new_profile': not (home / m.DBS[0]).exists()}
+        return plan_import(work, job, False)
     except BaseException:
         clean_job(work)
+        raise
+
+
+def import_groups(names):
+    """Bind helpers to their nearest ordinary chat; forks remain separate choices."""
+    groups = {sid: [sid] for sid, row in names.items() if not row.get('helper')}
+    owners = {}
+    for sid, row in names.items():
+        if not row.get('helper'):
+            continue
+        ancestor, seen = row.get('parent_id'), {sid}
+        while ancestor in names and ancestor not in seen:
+            seen.add(ancestor)
+            if ancestor in groups:
+                owners[sid] = ancestor
+                groups[ancestor].append(sid)
+                break
+            ancestor = names[ancestor].get('parent_id')
+    return groups, owners
+
+
+def grouped_history_selection(incoming, current, home, roots, groups, states, prefer_backup):
+    """A chat and its helpers form one atomic selection, including safety checks."""
+    resolver = selection.backup_history_selection if prefer_backup else selection.history_selection
+    roots, blocked = set(roots), {}
+    while True:
+        selected = {sid for root in roots for sid in groups[root]}
+        safe, external, rejected = resolver(incoming, current, home, selected, states)
+        invalid = {root for root in roots if not set(groups[root]) <= safe}
+        if not invalid:
+            return selected, external, blocked
+        for root in invalid:
+            failed = next(sid for sid in groups[root] if sid not in safe)
+            info = dict(rejected.get(failed, {'parent_id': failed}))
+            info['member_id'] = failed
+            blocked[root] = info
+        roots -= invalid
+
+
+def plan_import(work, job, prefer_backup):
+    incoming, current, home = preview_path(work, job, 'pack') / 'incoming', preview_path(work, job, 'current'), Path(job['home'])
+    states = job['states']
+    names = m.read_json(work / 'chat-names.json')
+    groups, owners = import_groups(names)
+    visible = {root for root, members in groups.items() if prefer_backup or
+               any(states[sid] in ('new', 'newer', 'conflict') for sid in members)}
+    candidates = {root for root in visible if prefer_backup or
+                  all(states[sid] in ('new', 'newer', 'same') for sid in groups[root])}
+    safe, required, blocked = grouped_history_selection(incoming, current, home, candidates, groups, states, prefer_backup)
+    schema = m.schema_compatibility(incoming, current) if safe else {'supported': True, 'differences': [], 'reason': ''}
+    if not schema['supported']:
+        safe = set()
+    labels = {'new': '新增聊天', 'newer': '备份有新增对话', 'conflict': '双方历史不同，保留本机',
+              'same': '主聊天内容相同，随附关联记录', 'older': '本机记录更多，保留本机'}
+    if prefer_backup:
+        labels.update(conflict='以备份为准，替换本机此聊天（保留回滚副本）',
+                      older='以备份为准，替换本机更多的记录（保留回滚副本）')
+    changes = []
+    for root in visible:
+        reason = labels[states[root]]
+        if root not in candidates and states[root] not in ('older', 'conflict'):
+            reason = '关联的内部助手或安全审查有冲突或本机内容更多；确认备份后可切换“以备份为准”。'
+        if root in blocked:
+            info = blocked[root]
+            parent = info['parent_id']
+            reason = info.get('reason') or ('共享历史无法安全复用；请一并选择父聊天：' + names.get(parent, {}).get('title', parent))
+            if info['member_id'] != root:
+                reason = '关联内部助手受阻：' + reason
+        if not schema['supported'] and root in candidates:
+            reason = schema['reason']
+        members = groups[root]
+        for sid in members:
+            row = dict(names[sid])
+            row.update(status=states[sid], reason=reason if sid == root else '随所属聊天自动导入，无需单独勾选。',
+                       selectable=root in safe, owner_id=owners.get(sid, ''), helper_count=len(members)-1 if sid == root else 0,
+                       source_records=job['source_records'][sid], local_records=job['local_records'].get(sid, 0))
+            changes.append(row)
+    changes.sort(key=lambda r: (r.get('group_rank', 0), r.get('helper', False), r.get('sort_order', 0), r['id']))
+    selected_roots = sorted(root for root in groups if root in safe)
+    job.update(selected=sorted(safe), selectable_chats=selected_roots, import_groups=groups, prefer_backup=bool(prefer_backup))
+    m.write_json(work / 'job.json', job)
+    return {'token': work.name, 'home': str(home), 'archive_home': str(incoming), 'changes': changes,
+            'source_chats': job['source_chats'], 'local_chats': job['local_chats'],
+            'same': list(states.values()).count('same'), 'local_newer': list(states.values()).count('older'),
+            'safe': len(safe), 'safe_chats': len(selected_roots), 'safe_helpers': len(safe)-len(selected_roots),
+            'orphan_helpers': sum(bool(row.get('helper')) and sid not in owners for sid, row in names.items()),
+            'blocked': len(blocked), 'conflicts': list(states.values()).count('conflict'),
+            'prefer_backup': bool(prefer_backup), 'schema': schema, 'local_refreshed': job.get('local_refreshed', False),
+            'created_at': job['bundle_created_at'], 'new_profile': job['new_profile']}
+
+
+def replan_import(token, prefer_backup, auto_close=True):
+    if type(prefer_backup) is not bool:
+        raise ValueError('必须明确选择是否以备份为准。')
+    work = job_path(token)
+    previous = m.read_json(work / 'job.json')
+    if previous['used']:
+        raise ValueError('这份预览已经导入完成，请重新核对。')
+    home = validate_home(previous['home'], allow_empty=True)
+    assert_no_pending(home)
+    ensure_closed(auto_close)
+    idle()
+    before, credentials = import_signature(home), m.credential_hashes(home)
+    created = []
+    try:
+        # Fresh names ensure a failed refresh never edits the usable old preview.
+        job = dict(previous)
+        current_name = 'current-' + uuid.uuid4().hex[:12]
+        current = work / current_name
+        created.append(current)
+        incoming_pack = preview_path(work, previous, 'pack')
+        manifest = m.read_json(incoming_pack / 'package.json')
+        provider, model = m.current_settings(home)
+        if (provider, model) != (manifest['provider'], manifest['model_fallback']):
+            progress('模型配置发生变化，重新适配已解压的备份副本。')
+            pack_name = 'pack-' + uuid.uuid4().hex[:12]
+            incoming_pack = work / pack_name
+            created.append(incoming_pack)
+            selection.prepare_package(work / 'data', home, incoming_pack)
+            job['pack_dir'] = pack_name
+        incoming = incoming_pack / 'incoming'
+        progress('重新读取本机稳定快照，更新冲突和分支核对结果；尚未写入聊天。')
+        if (home / m.DBS[0]).exists():
+            m.take_current(home, current, link_assets=True)
+        else:
+            empty_baseline(incoming, current)
+        source_catalog = m.read_json(incoming_pack / 'package.json').get('prepared_catalog') or selection.catalog(incoming)
+        destination_catalog = selection.catalog(current)
+        idle()
+        if import_signature(home) != before or m.credential_hashes(home) != credentials:
+            raise RuntimeError('重新核对期间本机聊天仍在变化，已保留上一次预览。请完全退出 Codex 后重试。')
+        job.update(current_dir=current_name, signature=before, credential_hashes=credentials,
+                   states=selection.classify(source_catalog, destination_catalog),
+                   source_records={sid: len(entry['events']) for sid, entry in source_catalog.items()},
+                   local_records={sid: len(entry['events']) for sid, entry in destination_catalog.items()},
+                   source_chats=len(source_catalog), local_chats=len(destination_catalog),
+                   new_profile=not (home / m.DBS[0]).exists(), local_refreshed=True)
+        return plan_import(work, job, prefer_backup)
+    except BaseException:
+        for path in created:
+            if path.exists() and path.resolve().parent == work.resolve() and re.fullmatch(r'(?:current|pack)-[0-9a-f]{12}', path.name):
+                shutil.rmtree(path)
         raise
 
 
@@ -628,6 +783,7 @@ def rollback_helper(backup):
     # An independent offline helper survives removal of the original app folder.
     shutil.copy2(ROOT / 'vendor' / 'python-3.11.9-embed-amd64.zip', backup / 'python-runtime.zip')
     shutil.copy2(ROOT / 'lib' / 'chat_merge.py', backup / 'chat_merge.py')
+    shutil.copy2(ROOT / 'lib' / 'session_io.py', backup / 'session_io.py')
     shutil.copy2(ROOT / 'src' / 'win_process.py', backup / 'win_process.py')
     script = r'''$ErrorActionPreference='Stop'
 $root=Split-Path -Parent $PSCommandPath
@@ -651,18 +807,26 @@ def apply_import(token, selected, auto_close=True):
         raise ValueError('这份预览已经导入完成，请重新核对。')
     if not selected:
         return {'noop': True, 'added': 0, 'updated': 0, 'selected': 0, 'backup': ''}
+    if not selected <= set(job['selectable_chats']):
+        raise ValueError('选择里包含不能导入的聊天。请选择可导入的主聊天；内部助手和安全审查会自动随所属聊天导入，不能单独勾选。预览仍可继续使用。')
+    groups = job['import_groups']
+    selected_roots = selected
+    selected = {sid for root in selected_roots for sid in groups[root]}
     if not selected <= set(job['selected']):
-        raise ValueError('选择里包含不能导入的聊天，请取消相应勾选。预览仍可继续使用。')
+        raise ValueError('关联记录不能完整导入，请重新核对。')
     ensure_closed(auto_close)
-    if signature(home) != job['signature'] or m.credential_hashes(home) != job['credential_hashes']:
+    if import_signature(home) != job['signature'] or m.credential_hashes(home) != job['credential_hashes']:
         raise RuntimeError('预览之后本机记录或配置有变化。为避免覆盖新对话，请重新选择备份包进行核对。')
-    safe, external, blocked = selection.history_selection(work / 'pack' / 'incoming', work / 'current', home, selected, job['states'])
+    resolver = selection.backup_history_selection if job.get('prefer_backup') else selection.history_selection
+    safe, external, blocked = resolver(preview_path(work, job, 'pack') / 'incoming', preview_path(work, job, 'current'), home, selected, job['states'])
     if blocked or safe != selected:
         raise RuntimeError('当前勾选的分支还需要同时勾选可导入的父聊天。请回到列表补选，不能单独覆盖共享历史。')
     attempt = work / ('attempt-' + uuid.uuid4().hex[:8])
     attempt.mkdir()
     try:
-        return install_attempt(work, job, home, selected, external, attempt)
+        result = install_attempt(work, job, home, selected, external, attempt)
+        result.update(selected_chats=len(selected_roots), selected_helpers=len(selected)-len(selected_roots))
+        return result
     finally:
         if attempt.exists() and attempt.resolve().parent == work.resolve() and re.fullmatch(r'attempt-[0-9a-f]{8}', attempt.name):
             shutil.rmtree(attempt)
@@ -677,14 +841,15 @@ def install_attempt(work, job, home, selected, external, attempt):
             except OSError: pass
         return shutil.copy2(source, destination)
     # Selection may prune an isolated attempt, never the reusable preview.
-    shutil.copytree(work / 'pack', attempt / 'pack', copy_function=isolated_copy)
+    shutil.copytree(preview_path(work, job, 'pack'), attempt / 'pack', copy_function=isolated_copy)
     manifest = selection.restrict_package(attempt / 'pack', selected, external)
-    renamed = asset_conflicts.resolve(attempt / 'pack' / 'incoming', work / 'current', home, manifest, m)
+    renamed = asset_conflicts.resolve(attempt / 'pack' / 'incoming', preview_path(work, job, 'current'), home, manifest, m)
     progress('在隔离目录演练合并，核对项目、分支、消息偏移和原有记录。')
     stage = attempt / 'merged'
-    report = m.build_merge(work / 'current', stage, home, manifest)
+    report = m.build_merge(preview_path(work, job, 'current'), stage, home, manifest)
+    report['import_policy'] = 'backup' if job.get('prefer_backup') else 'preserve'
     idle()
-    if signature(home) != job['signature'] or m.credential_hashes(home) != job['credential_hashes']:
+    if import_signature(home) != job['signature'] or m.credential_hashes(home) != job['credential_hashes']:
         raise RuntimeError('正式写入前检测到本机状态改变，已停止。请重新预览。')
     home.mkdir(parents=True, exist_ok=True)
     backup = home.parent / 'Codex-chat-merge-backups' / ('zhiru-' + dt.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6])
@@ -700,7 +865,7 @@ def install_attempt(work, job, home, selected, external, attempt):
             shutil.copytree(stage, local_stage / 'data')
             stage = local_stage / 'data'
         idle()
-        if signature(home) != job['signature']:
+        if import_signature(home) != job['signature']:
             raise RuntimeError('复制期间本机聊天发生变化，已停止写入。请重新核对。')
         progress('正在保留回滚副本并安装已勾选的聊天，请勿关闭窗口。')
         m.install_stage(stage, home, backup, m.managed_names(home), report, manifest['package_id'],
@@ -720,7 +885,55 @@ def install_attempt(work, job, home, selected, external, attempt):
     return {'added': report['added_chats'], 'updated': report['overlapping_chats_updated_from_cloud'],
             'total': report['total_chats'], 'backup': str(backup), 'selected': len(selected), 'renamed_assets': renamed,
             'compatibility_rows_preserved': report.get('compatibility_rows_preserved', 0),
+            'repaired_previews': report.get('repaired_previews', 0),
+            'missing_project_directories': report.get('missing_project_directories', []),
             'compatibility_values_restored': report.get('compatibility_values_restored', 0)}
+
+
+def repair_previews(home):
+    """Explicit local repair of already imported list metadata, with rollback."""
+    home = validate_home(home)
+    assert_no_pending(home)
+    idle()  # Never close a running app as a side effect of the diagnostic tool.
+    work = new_job()
+    local_stage = None
+    try:
+        before, credentials = signature(home), m.credential_hashes(home)
+        stage = work / 'stage'
+        m.take_current(home, stage, link_assets=True)
+        with contextlib.closing(sqlite3.connect(stage / m.DBS[0])) as db, db:
+            selected = {row[0] for row in db.execute('SELECT id FROM threads')}
+            repaired = m.repair_thread_previews(db, selected)
+            m.check_db(db)
+        if not repaired:
+            return {'repaired_previews': 0, 'backup': '', 'noop': True}
+        helper = work / 'rollback-helper'
+        helper.mkdir()
+        rollback_helper(helper)
+        idle()
+        if signature(home) != before or m.credential_hashes(home) != credentials:
+            raise RuntimeError('诊断后聊天或配置发生变化，已停止修复。请退出 Codex 后重试。')
+        backup = home.parent / 'Codex-chat-merge-backups' / ('zhiru-' + dt.datetime.now().strftime('%Y%m%d-%H%M%S') + '-preview-' + uuid.uuid4().hex[:6])
+        if stage.drive.casefold() != home.drive.casefold():
+            local_stage = Path(tempfile.mkdtemp(prefix='.codex-zhiru-stage-', dir=home.parent))
+            shutil.copytree(stage, local_stage / 'data')
+            stage = local_stage / 'data'
+        idle()
+        if signature(home) != before or m.credential_hashes(home) != credentials:
+            raise RuntimeError('复制期间聊天或配置发生变化，已停止修复。')
+        try:
+            m.install_stage(stage, home, backup, m.managed_names(home),
+                            {'repaired_previews': repaired}, 'preview-' + uuid.uuid4().hex,
+                            idle_check=idle, helper_source=helper)
+        except BaseException as exc:
+            if (backup / 'transaction.json').exists():
+                raise RuntimeError(str(exc) + '\n恢复记录和独立回滚工具位于：' + str(backup)) from exc
+            raise
+        return {'repaired_previews': repaired, 'backup': str(backup), 'noop': False}
+    finally:
+        if local_stage and local_stage.resolve().parent == home.parent and local_stage.name.startswith('.codex-zhiru-stage-'):
+            shutil.rmtree(local_stage)
+        clean_job(work)
 
 
 def assert_no_pending(home):
@@ -768,7 +981,7 @@ def operation_lock():
 
 
 def main(request):
-    if request.get('action') in ('export', 'preview', 'apply', 'rollback', 'prepare_readers'):
+    if request.get('action') in ('export', 'preview', 'apply', 'rollback', 'prepare_readers', 'repair_previews', 'replan'):
         with operation_lock():
             return dispatch(request)
     return dispatch(request)
@@ -793,10 +1006,14 @@ def dispatch(request):
         return prepare_readers(request['home'], request.get('archive_home'), request.get('auto_close', True))
     if action == 'preview':
         return preview_import(request['bundle'], request['home'], request.get('auto_close', True))
+    if action == 'replan':
+        return replan_import(request['token'], request['prefer_backup'], request.get('auto_close', True))
     if action == 'apply':
         return apply_import(request['token'], request['selected'], request.get('auto_close', True))
     if action == 'rollback':
         return rollback_latest(request['home'], request.get('auto_close', True))
+    if action == 'repair_previews':
+        return repair_previews(request['home'])
     if action == 'cleanup':
         clean_job(job_path(request['token']))
         return {'cleaned': True}

@@ -1,7 +1,7 @@
 ﻿$ErrorActionPreference = 'Stop'
 & (Join-Path $PSScriptRoot 'build.ps1')
 $taskRelease = Join-Path $PSScriptRoot '发布包'
-$taskZip = Join-Path $taskRelease 'codex-zhiru-1.3.0-Windows-x64.zip'
+$taskZip = Join-Path $taskRelease 'codex-zhiru-1.3.5-Windows-x64.zip'
 if (Test-Path -LiteralPath $taskZip) {
     throw 'Release destination exists. Preserve or move the previous release before packaging again.'
 }
@@ -16,7 +16,9 @@ import sys
 import zipfile
 
 root, target = map(Path, sys.argv[1:])
-files = ('codex智入.exe', '使用说明.txt', 'src/offline.py', 'src/win_process.py',
+files = ('codex智入.exe', '使用说明.txt', 'README.md', 'KNOWN_ISSUES.md', 'diagnose.cmd', 'diagnose.ps1',
+         'THIRD_PARTY_NOTICES.md', 'vendor/zstd-LICENSE.txt', 'vendor/zstd-v1.5.7-win64.zip', 'lib/session_io.py',
+         'src/chat_diagnostics.py', 'src/offline.py', 'src/win_process.py',
          'src/sidebar.py', 'src/asset_conflicts.py', 'lib/chat_merge.py',
          'lib/chat_select.py', 'lib/chat_snapshot.py', 'vendor/python-3.11.9-embed-amd64.zip')
 target.parent.mkdir(parents=True, exist_ok=True)

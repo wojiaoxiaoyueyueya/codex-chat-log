@@ -1,6 +1,7 @@
 """Content-aware, selective sync. All merge work happens in disposable staging."""
 from __future__ import annotations
 import argparse
+import contextlib
 import hashlib
 import json
 from pathlib import Path
@@ -32,7 +33,7 @@ def catalog(home):
         db.close()
     segments = {}
     for path in merge.ordered_transcripts(home):
-        with path.open('rb') as f:
+        with merge.open_transcript(path) as f:
             first = json.loads(f.readline())
             meta = first['payload']
             base = meta.get('history_base')
@@ -226,6 +227,38 @@ def history_selection(source, destination, home, selected, states):
         selected -= rejected.keys()
 
 
+def backup_history_selection(source, destination, home, selected, states):
+    """Backup can replace selected IDs, while preserved local forks keep ancestry."""
+    current_paths = {merge.session_storage_id(p): p for p in merge.ordered_transcripts(destination)}
+    source_paths = {merge.session_storage_id(p): p for p in merge.ordered_transcripts(source)}
+    owners = {sid: (merge.transcript_metadata(p).get('id') or merge.transcript_metadata(p).get('session_id'))
+              for sid, p in current_paths.items()}
+    with contextlib.closing(merge.db_open(destination / merge.DBS[0], True)) as db:
+        local_ids = {row[0] for row in db.execute('SELECT id FROM threads')}
+    selected, blocked = set(selected), {}
+    mapper = merge.Mapper(str(home.parent), home)
+    while True:
+        safe, external, incoming_blocked = history_selection(source, destination, home, selected, states)
+        blocked.update(incoming_blocked)
+        rejected = {}
+        requirements = merge.preserved_history_requirements(destination, safe & local_ids, home)
+        for requirement in requirements:
+            owner = owners.get(requirement['storage_id'])
+            if owner not in safe:
+                continue
+            path = source_paths.get(requirement['storage_id'])
+            try:
+                reusable = path is not None and merge.history_prefix_hash(path, requirement['cut'], mapper) == requirement['sha256']
+            except RuntimeError:
+                reusable = False
+            if not reusable:
+                rejected[owner] = {'parent_id': owner, 'reason': '本机保留的分支依赖此聊天的不同旧历史，暂不能单独替换父聊天。'}
+        if not rejected:
+            return safe, external, blocked
+        blocked.update(rejected)
+        selected = safe - rejected.keys()
+
+
 def resolve_history_selection(source, destination, home, selected, states, entries, ask=input):
     """Require explicit consent to add parents or to proceed with fewer chats."""
     requested = set(selected)
@@ -371,7 +404,7 @@ def restrict_package(work, selected, external_history=()):
     manifest['files'] = [{'path': p.relative_to(data).as_posix(), 'size': p.stat().st_size,
                           'sha256': merge.sha(p)} for p in merge.safe_files(data)]
     manifest['original_source_files'] = [f for f in manifest['original_source_files']
-                                         if f['path'] in {x['path'] for x in manifest['files']}]
+                                         if f.get('prepared_path', f['path']) in {x['path'] for x in manifest['files']}]
     merge.write_json(work / 'package.json', manifest)
     return merge.verify_package()
 

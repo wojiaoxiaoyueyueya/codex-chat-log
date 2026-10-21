@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import array
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -15,6 +16,9 @@ import sys
 import time
 import tomllib
 import uuid
+# The embedded runtime uses -I, including the independent rollback launcher.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from session_io import is_transcript, plain_path, physical_path, preferred, open_transcript
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
 WORK_ROOT = SCRIPT_ROOT
@@ -218,7 +222,7 @@ def current_settings(target):
     return data.get('model_provider', 'openai'), data.get('model')
 
 def session_storage_id(path):
-    found = re.search(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$', path.name, re.I)
+    found = re.search(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl(?:\.zst)?$', path.name, re.I)
     if not found:
         raise RuntimeError('Unrecognized transcript filename: ' + path.name)
     return found.group(1)
@@ -227,9 +231,11 @@ def ordered_transcripts(source):
     pending = {}
     for directory in ('sessions', 'archived_sessions'):
         for p in safe_files(source / directory):
-            if p.suffix != '.jsonl':
+            if not is_transcript(p):
                 raise RuntimeError('Unexpected session file: ' + p.name)
-            with p.open('rb') as f:
+            if not preferred(p):
+                continue
+            with open_transcript(p) as f:
                 meta = json.loads(f.readline()).get('payload', {})
             storage_id = session_storage_id(p)
             if storage_id in pending:
@@ -246,7 +252,7 @@ def ordered_transcripts(source):
     return result
 
 def transcript_metadata(path):
-    with path.open('rb') as stream:
+    with open_transcript(path) as stream:
         return json.loads(stream.readline())['payload']
 
 
@@ -265,7 +271,7 @@ def history_prefix_hash(path, cut, mapper):
     if not isinstance(cut, int) or cut < start:
         raise RuntimeError('Invalid shared history boundary')
     digest = hashlib.sha256()
-    with path.open('rb') as stream:
+    with open_transcript(path) as stream:
         for ordinal in range(start, cut):
             raw = stream.readline()
             if not raw.endswith(b'\n'):
@@ -340,7 +346,7 @@ def repair_merged_history(stage, incoming_paths):
             # All message bytes and every unselected transcript stay untouched.
             temporary = path.with_suffix('.tmp') if selected and base and base.get('end_byte_offset') != new_offset else None
             try:
-                with path.open('rb') as stream:
+                with open_transcript(path) as stream:
                     out = temporary.open('wb') if temporary else None
                     try:
                         for index, raw in enumerate(stream):
@@ -427,6 +433,8 @@ def prepare(source, target):
                 new = val
                 if k in ('rollout_path', 'cwd', 'path') and isinstance(val, str):
                     new = mapper.path(val)
+                    if k == 'rollout_path':
+                        new = str(plain_path(new))
                 elif k in ('sandbox_policy', 'payload', 'metadata') and isinstance(val, str):
                     try:
                         obj = json.loads(val)
@@ -448,89 +456,92 @@ def prepare(source, target):
     c.execute('VACUUM')
     check_db(c)
     c.close()
-    hist = sqlite3.connect(data / DBS[1])
-    line_counts = {}
-    session_ids = {}
-    segment_offsets = {}
-    segment_events, prepared_catalog = {}, {}
-    original_fingerprints = []
-    ordered = ordered_transcripts(source)
-    other_files = [p for directory in DIRS[2:] for p in safe_files(source / directory)]
-    for src in ordered + other_files:
-        directory = src.relative_to(source).parts[0]
-        if True:
-            rel = src.relative_to(source)
-            dst = data / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            before = (src.stat().st_size, src.stat().st_mtime_ns)
-            if directory in ('sessions', 'archived_sessions') and src.suffix == '.jsonl':
-                offsets = array.array('Q', [0])
-                original_hash = hashlib.sha256()
-                sid = None
-                storage_id = session_storage_id(src)
-                ordinal_base = 0
-                events = []
-                with src.open('rb') as f, dst.open('wb') as out:
-                    for ordinal, raw in enumerate(f):
-                        if not raw.endswith(b'\n'):
-                            raise RuntimeError('聊天历史末尾未写完，请在旧电脑完全退出 Codex 后重新导出：' + str(rel))
-                        original_hash.update(raw)
-                        if not raw.strip():
-                            raise RuntimeError('Empty transcript line: ' + str(rel))
-                        obj = json.loads(raw)
-                        new = mapper.obj(obj)
-                        if ordinal == 0:
-                            payload = new.get('payload', {})
-                            sid = payload.get('id') or payload.get('session_id')
-                            if not sid:
-                                raise RuntimeError('Transcript has no session ID: ' + str(rel))
-                            base = payload.get('history_base')
-                            if base:
-                                parent_base, parent_offsets = segment_offsets[base['thread_id']]
-                                ordinal_base = base['end_ordinal_exclusive']
-                                cut = ordinal_base - parent_base
-                                if not 0 <= cut < len(parent_offsets):
-                                    raise RuntimeError('Invalid history segment boundary')
-                                base['end_byte_offset'] = parent_offsets[cut]
-                                events = [(n, h) for n, h in segment_events[base['thread_id']] if n < ordinal_base]
-                        if new.get('type') == 'session_meta' and isinstance(new.get('payload'), dict):
-                            new['payload']['model_provider'] = provider
-                        rendered = (json.dumps(new, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8') if new != obj else raw
-                        out.write(rendered)
-                        offsets.append(offsets[-1] + len(rendered))
-                        digest = event_digest(new)
-                        if digest: events.append((ordinal_base + ordinal, digest))
-                        if ordinal and ordinal % 10000 == 0:
-                            log('整理聊天历史 %d/%d · 当前记录 %d 条' % (len(session_ids) + 1, len(ordered), ordinal))
-                session_ids[rel.as_posix()] = sid
-                segment_offsets[storage_id] = (ordinal_base, offsets)
-                segment_events[storage_id] = events
-                repair_segment_offsets(hist, storage_id, ordinal_base, offsets)
-                active_sid = active_paths.get(str(target / rel).lower())
-                if active_sid:
-                    if active_sid != sid:
-                        raise RuntimeError('Transcript ID does not match database')
-                    prepared_catalog[sid] = {'title': sid, 'events': [h for _, h in events]}
-                    line_counts[sid] = len(offsets) - 1
-                original_fingerprints.append({'path': rel.as_posix(), 'size': before[0], 'sha256': original_hash.hexdigest()})
-                log('Prepared transcript ' + str(len(session_ids)) + '/' + str(len(ordered)))
-            else:
-                if rel == PASTED_TEXT_REGISTRY:
-                    write_json(dst, map_attachment_registry(read_attachment_registry(src), mapper))
+    with contextlib.closing(sqlite3.connect(data / DBS[1])) as hist:
+        line_counts = {}
+        session_ids = {}
+        segment_offsets = {}
+        segment_events, prepared_catalog = {}, {}
+        original_fingerprints = []
+        ordered = ordered_transcripts(source)
+        other_files = [p for directory in DIRS[2:] for p in safe_files(source / directory)]
+        for src in ordered + other_files:
+            directory = src.relative_to(source).parts[0]
+            if True:
+                rel = src.relative_to(source)
+                source_relative = rel
+                if directory in ('sessions', 'archived_sessions'):
+                    rel = plain_path(rel)
+                dst = data / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                before = (src.stat().st_size, src.stat().st_mtime_ns)
+                if directory in ('sessions', 'archived_sessions') and is_transcript(src):
+                    offsets = array.array('Q', [0])
+                    original_hash = hashlib.sha256()
+                    sid = None
+                    storage_id = session_storage_id(src)
+                    ordinal_base = 0
+                    events = []
+                    with open_transcript(src) as f, dst.open('wb') as out:
+                        for ordinal, raw in enumerate(f):
+                            if not raw.endswith(b'\n'):
+                                raise RuntimeError('聊天历史末尾未写完，请在旧电脑完全退出 Codex 后重新导出：' + str(rel))
+                            original_hash.update(raw)
+                            if not raw.strip():
+                                raise RuntimeError('Empty transcript line: ' + str(rel))
+                            obj = json.loads(raw)
+                            new = mapper.obj(obj)
+                            if ordinal == 0:
+                                payload = new.get('payload', {})
+                                sid = payload.get('id') or payload.get('session_id')
+                                if not sid:
+                                    raise RuntimeError('Transcript has no session ID: ' + str(rel))
+                                base = payload.get('history_base')
+                                if base:
+                                    parent_base, parent_offsets = segment_offsets[base['thread_id']]
+                                    ordinal_base = base['end_ordinal_exclusive']
+                                    cut = ordinal_base - parent_base
+                                    if not 0 <= cut < len(parent_offsets):
+                                        raise RuntimeError('Invalid history segment boundary')
+                                    base['end_byte_offset'] = parent_offsets[cut]
+                                    events = [(n, h) for n, h in segment_events[base['thread_id']] if n < ordinal_base]
+                            if new.get('type') == 'session_meta' and isinstance(new.get('payload'), dict):
+                                new['payload']['model_provider'] = provider
+                            rendered = (json.dumps(new, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8') if new != obj else raw
+                            out.write(rendered)
+                            offsets.append(offsets[-1] + len(rendered))
+                            digest = event_digest(new)
+                            if digest: events.append((ordinal_base + ordinal, digest))
+                            if ordinal and ordinal % 10000 == 0:
+                                log('整理聊天历史 %d/%d · 当前记录 %d 条' % (len(session_ids) + 1, len(ordered), ordinal))
+                    session_ids[rel.as_posix()] = sid
+                    segment_offsets[storage_id] = (ordinal_base, offsets)
+                    segment_events[storage_id] = events
+                    repair_segment_offsets(hist, storage_id, ordinal_base, offsets)
+                    active_sid = active_paths.get(str(target / rel).lower())
+                    if active_sid:
+                        if active_sid != sid:
+                            raise RuntimeError('Transcript ID does not match database')
+                        prepared_catalog[sid] = {'title': sid, 'events': [h for _, h in events]}
+                        line_counts[sid] = len(offsets) - 1
+                    original_fingerprints.append({'path': source_relative.as_posix(), 'prepared_path': rel.as_posix(),
+                                                  'size': before[0], 'sha256': sha(src) if src.suffix == '.zst' else original_hash.hexdigest()})
+                    log('Prepared transcript ' + str(len(session_ids)) + '/' + str(len(ordered)))
                 else:
-                    shutil.copy2(src, dst)
-                original_fingerprints.append({'path': rel.as_posix(), 'size': before[0], 'sha256': sha(src)})
-            if before != (src.stat().st_size, src.stat().st_mtime_ns):
-                raise RuntimeError('Source changed while preparing: ' + str(rel))
-    for table in ('thread_items', 'thread_realtime_items'):
-        for rowid, val in hist.execute('SELECT rowid,item_json FROM ' + table):
-            obj = json.loads(val)
-            mapped = mapper.obj(obj)
-            if obj != mapped:
-                hist.execute('UPDATE ' + table + ' SET item_json=? WHERE rowid=?', (json.dumps(mapped, ensure_ascii=False, separators=(',', ':')), rowid))
-    hist.commit()
-    check_db(hist)
-    hist.close()
+                    if rel == PASTED_TEXT_REGISTRY:
+                        write_json(dst, map_attachment_registry(read_attachment_registry(src), mapper))
+                    else:
+                        shutil.copy2(src, dst)
+                    original_fingerprints.append({'path': rel.as_posix(), 'size': before[0], 'sha256': sha(src)})
+                if before != (src.stat().st_size, src.stat().st_mtime_ns):
+                    raise RuntimeError('Source changed while preparing: ' + str(rel))
+        for table in ('thread_items', 'thread_realtime_items'):
+            for rowid, val in hist.execute('SELECT rowid,item_json FROM ' + table):
+                obj = json.loads(val)
+                mapped = mapper.obj(obj)
+                if obj != mapped:
+                    hist.execute('UPDATE ' + table + ' SET item_json=? WHERE rowid=?', (json.dumps(mapped, ensure_ascii=False, separators=(',', ':')), rowid))
+        hist.commit()
+        check_db(hist)
     if len(line_counts) != len(rows):
         raise RuntimeError('Some database threads lack an active transcript')
     for name in ('session_index.jsonl', 'history.jsonl'):
@@ -618,7 +629,7 @@ def take_current(target, dest, rehearsal=False, include_assets=True, link_assets
         else:
             # Work from a closed-source file copy, including every pending WAL page.
             # Opening the real target with SQLite could otherwise create sidecar files.
-            raw = dest.parent / 'raw-current-databases'
+            raw = dest.parent / ('raw-current-databases-' + uuid.uuid4().hex[:12])
             raw.mkdir(exist_ok=True)
             for suffix in ('', '-wal', '-shm'):
                 p = target / (name + suffix)
@@ -638,6 +649,27 @@ def merge_value(current, incoming):
 
 def cols(c, table):
     return [r[1] for r in c.execute('PRAGMA table_info(' + quote(table) + ')')]
+
+
+def repair_thread_previews(db, selected_ids):
+    """Restore list metadata only from Codex's recorded first user preview.
+
+    Codex's default active-thread query excludes preview=''. An older database
+    can omit this newer column, leaving imported rows at the target's empty
+    default. Do not invent previews for empty/internal threads or change any
+    existing nonempty preview. The caller owns the isolated DB transaction.
+    """
+    if not {'preview', 'first_user_message'} <= set(cols(db, 'threads')):
+        return 0
+    selected_ids = set(selected_ids)
+    changed = 0
+    rows = db.execute("SELECT id,first_user_message FROM threads "
+                      "WHERE (preview IS NULL OR preview='') AND first_user_message<>''").fetchall()
+    for sid, preview in rows:
+        if sid in selected_ids and isinstance(preview, str) and preview.strip():
+            db.execute('UPDATE threads SET preview=? WHERE id=?', (preview, sid))
+            changed += 1
+    return changed
 
 def schema_compatibility(source, target):
     differences, failures = [], []
@@ -799,7 +831,7 @@ def assert_current_rows_preserved(before, after, cloud_ids, cloud_history_ids=No
 
 def transcript_thread_id(path):
     try:
-        with Path(path).open('rb') as f:
+        with open_transcript(path) as f:
             payload = json.loads(f.readline()).get('payload', {})
         return payload.get('id') or payload.get('session_id')
     except (OSError, ValueError, UnicodeError) as exc:
@@ -873,7 +905,7 @@ def build_merge(current, stage, target, manifest):
                 d.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(p, d)
     table_counts = {}
-    compatibility, restored_metadata = [], 0
+    compatibility, restored_metadata, repaired_previews = [], 0, 0
     for name, tables in ((DBS[0], STATE_TABLES), (DBS[1], HISTORY_TABLES)):
         replaced_ids = cloud_history_ids if name == DBS[1] else updated
         a, b = db_open(incoming / name, True), sqlite3.connect(stage / name)
@@ -900,6 +932,8 @@ def build_merge(current, stage, target, manifest):
                                       ','.join('?' for _ in edge) + ')', tuple(edge.values()))
                 if name == DBS[1]:
                     restored_metadata = restore_history_compat(b, stage, cloud_history_ids - (existing_ids - updated))
+                else:
+                    repaired_previews = repair_thread_previews(b, source_ids)
             check_db(b)
         finally:
             a.close()
@@ -970,6 +1004,7 @@ def build_merge(current, stage, target, manifest):
             'cloud_asset_files_updated': len(updated_assets),
             'overlapping_chats_updated_from_cloud': len(updated), 'table_rows_added': table_counts,
             'missing_project_directories': sorted(set(missing)), 'local_only_database_rows_preserved': True,
+            'repaired_previews': repaired_previews,
             'local_only_transcripts_preserved': True, 'current_login_and_config_preserved': True,
             'compatibility_rows_preserved': len(compatibility), 'compatibility_values_restored': restored_metadata}
 

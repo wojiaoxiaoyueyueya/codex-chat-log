@@ -2,6 +2,7 @@
 *.czr
 *.czr.*
 *.jsonl
+*.jsonl.zst
 *.sqlite
 *.sqlite-*
 *.sqlite.*
@@ -39,5 +40,9 @@ tests/GracefulWindow.exe
 private-backup/
 *.bundle
 *.log
+.test-tmp/
+.diagnostics-cache/
+codex-diagnostic-*.txt
 *.zip
 !vendor/python-3.11.9-embed-amd64.zip
+!vendor/zstd-v1.5.7-win64.zip

@@ -50,7 +50,7 @@ def apply(chats, rows, projects, roots, sections, global_state, home):
         source = object_value(record.get('source'))
         row['helper'] = bool(row.get('helper') or source.get('subagent') or
                              record.get('thread_source') in ('guardian_review', 'subagent') or record.get('agent_nickname'))
-        row['guardian'] = bool(record.get('thread_source') == 'guardian_review' or
+        row['guardian'] = bool(row.get('guardian') or record.get('thread_source') == 'guardian_review' or
                                object_value(source.get('subagent')).get('other') == 'guardian' or
                                (row['helper'] and row['title'].casefold() == 'guardian review'))
         row['section_id'] = record.get('thread_section_id') or ''

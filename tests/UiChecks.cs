@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
@@ -41,6 +41,10 @@ public class UiChecks {
             {"messages",new object[]{new Dictionary<string,object>{{"role","assistant"},{"text",title},{"time",""}}}},
             {"start",0},{"total",1}};
     }
+    static Dictionary<string,object> ChangeRow(string id,bool helper,string owner,bool selectable,int helperCount) {
+        return new Dictionary<string,object>{{"id",id},{"title",id},{"project","fixture"},{"reason",helper?"随所属聊天自动导入":"新增聊天"},
+            {"helper",helper},{"owner_id",owner},{"helper_count",helperCount},{"selectable",selectable},{"status","new"}};
+    }
     static void Pump(Task task) {
         if(task.IsCompleted) {task.GetAwaiter().GetResult();return;}
         var frame=new DispatcherFrame();var timeout=new DispatcherTimer {Interval=TimeSpan.FromSeconds(3)};
@@ -82,6 +86,16 @@ public class UiChecks {
             Check(Walk(quote).OfType<Section>().Any(),"Quote renders as quote section");
 
             var window=new MainWindow(new[]{"--ui-test"});
+            var policy=(Button)Field(window,"backupPolicy");
+            Check(!policy.IsEnabled,"Backup policy requires a preview");
+            Set(window,"token","synthetic-preview");Call(window,"UpdateSelection");
+            Check(policy.IsEnabled&&Convert.ToString(policy.Content).Contains("以备份为准"),"Explicit backup policy button available");
+            Set(window,"preferBackup",true);Call(window,"UpdateSelection");
+            Check(Convert.ToString(policy.Content).Contains("保留本机"),"Backup policy can switch back");
+            string confirmation=(string)Call(window,"ImportConfirmation",3);
+            Check(confirmation.Contains("替换为备份")&&confirmation.Contains("回滚副本"),"Backup confirmation explains replacement and rollback");
+            Call(window,"Busy",true,"replan");Check(!policy.IsEnabled,"No policy changes during an operation");
+            Call(window,"Busy",false,"done");Set(window,"token",null);Set(window,"preferBackup",false);Call(window,"UpdateSelection");
             var rows=(List<Dictionary<string,object>>)Field(window,"chats");
             rows.Add(new Dictionary<string,object>{{"id","one"},{"title","hello"},{"project","项目"},{"project_id","p"},{"parent_id",""},{"archived",false}});
             Call(window,"RenderTree");window.Show();window.UpdateLayout();
@@ -107,6 +121,37 @@ public class UiChecks {
             Check(((TextBlock)Field(window,"status")).Text=="write","Browsing does not replace operation progress");
             Call(window,"EndReading",new object[]{null});
             Call(window,"Busy",false,"ready");window.Close();
+
+            var bound=new MainWindow(new[]{"--ui-test"});
+            Set(bound,"token","synthetic-bound-preview");
+            Call(bound,"SetImportPlan",new Dictionary<string,object> {
+                {"changes",new object[]{ChangeRow("parent",false,"",true,2),ChangeRow("review",true,"parent",true,0),
+                    ChangeRow("nested-helper",true,"parent",true,0),ChangeRow("independent",false,"",true,0),
+                    ChangeRow("blocked",false,"",false,1),ChangeRow("blocked-helper",true,"blocked",false,0)}},
+                {"safe_chats",2},{"safe_helpers",2},{"source_chats",6},{"local_chats",0}});
+            var boundRows=(List<Change>)Field(bound,"changes");
+            var parent=boundRows.Single(c=>c.Id=="parent");
+            Check(boundRows.Where(c=>c.Helper&&c.Selectable).All(c=>c.Selected),"Helpers initially follow selected owner");
+            Check(((List<CheckBox>)Field(bound,"changeChecks")).Count==3,"Only ordinary chats have checkboxes, including blocked chat");
+            var boundTree=(TreeView)Field(bound,"differences");
+            var boundGroup=(TreeViewItem)boundTree.Items[0];
+            Check(boundGroup.Items.Count==3,"Helpers never appear as standalone import choices");
+            var parentNode=(TreeViewItem)boundGroup.Items[0];
+            var helperGroup=(TreeViewItem)parentNode.Items[0];
+            Check(helperGroup.Items.Count==2,"Nested helpers and review appear under owning chat");
+            Check(helperGroup.Items.Cast<TreeViewItem>().All(n=>!Walk((DependencyObject)n.Header).OfType<CheckBox>().Any()),"Attached records have no checkbox");
+            parent.Selected=false;
+            Check(boundRows.Where(c=>c.Helper).All(c=>!c.Selected),"Unchecking owner cancels every helper");
+            Check(((TextBlock)Field(bound,"selectionSummary")).Text.Contains("自动随附 0"),"Counts update after owner deselection");
+            ((Button)Field(bound,"selectAll")).RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Check(parent.Selected&&boundRows.Where(c=>c.Helper&&c.Selectable).All(c=>c.Selected),"Select all includes helpers through owners");
+            Check(!boundRows.Single(c=>c.Id=="blocked-helper").Selected,"Select all cannot include blocked helper group");
+            Check(((string)Call(bound,"ImportConfirmation",2)).Contains("自动随附 2"),"Confirmation counts automatic helpers separately");
+            ((Button)Field(bound,"selectNone")).RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+            Check(boundRows.All(c=>!c.Selected)&&!((Button)Field(bound,"applyButton")).IsEnabled,"Cancel all clears owners and helpers and disables import");
+            parent.Selected=true;
+            Check(boundRows.Where(c=>c.OwnerId=="parent").All(c=>c.Selected)&&!boundRows.Single(c=>c.Id=="independent").Selected,"Reselecting owner binds only its own records");
+            bound.Close();
 
             var pending=new Dictionary<string,TaskCompletionSource<Dictionary<string,object>>>();
             var requestedHomes=new Dictionary<string,string>();

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
@@ -29,10 +29,12 @@ namespace CodexZhiru {
         public string Reason { get; set; }
         public bool Selectable { get; set; }
         public bool Helper { get; set; }
+        public string OwnerId { get; set; }
+        public int HelperCount { get; set; }
         public string Status { get; set; }
         public Dictionary<string,object> Source { get; set; }
         private bool selected;
-        public bool Selected { get { return selected; } set { selected = value; if (PropertyChanged != null) PropertyChanged(this, new PropertyChangedEventArgs("Selected")); } }
+        public bool Selected { get { return selected; } set { if(selected==value) return; selected = value; if (PropertyChanged != null) PropertyChanged(this, new PropertyChangedEventArgs("Selected")); } }
         public event PropertyChangedEventHandler PropertyChanged;
     }
 
@@ -52,10 +54,10 @@ namespace CodexZhiru {
         private StackPanel compareMessages;
         private TextBlock compareTitle, compareMeta, comparePage, selectionSummary;
         private ComboBox compareSide;
-        private Button selectAll, selectNone, compareOlder, compareNewer;
+        private Button selectAll, selectNone, compareOlder, compareNewer, backupPolicy;
         private Change compareChange;
         private int compareStart, compareTotal;
-        private bool renderingDifferences;
+        private bool renderingDifferences, preferBackup;
         private Button exportButton, importButton, applyButton, refreshButton, folderButton, rollbackButton, olderButton, newerButton;
         private List<Dictionary<string, object>> chats = new List<Dictionary<string, object>>();
         private List<Change> changes = new List<Change>();
@@ -64,6 +66,7 @@ namespace CodexZhiru {
         private bool busy, initializing, closingAfterCleanup;
         private bool browseReady;
         private string browseHome, browseArchiveHome;
+        private bool syncingSelection;
         private readonly List<CheckBox> changeChecks = new List<CheckBox>();
         private int reading, conversationRequest, comparisonRequest;
         private readonly bool designMode;
@@ -113,7 +116,7 @@ namespace CodexZhiru {
   <Grid><Grid.ColumnDefinitions><ColumnDefinition Width='Auto'/><ColumnDefinition Width='*'/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
    <Border Background='#17674D' Width='42' Height='42' CornerRadius='12' Margin='0,0,12,0'><TextBlock Text='↕' Foreground='White' FontSize='29' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>
    <StackPanel Grid.Column='1'><TextBlock Text='codex智入' FontSize='22' FontWeight='SemiBold' Foreground='#184B37'/><TextBlock Text='把对话带走，把新内容留下。' Margin='0,3,0,0' FontSize='11.5' Foreground='#82968A'/></StackPanel>
-   <Border Grid.Column='2' Background='#EDF6F0' CornerRadius='12' Padding='12,6' VerticalAlignment='Center'><TextBlock Text='●  纯本地运行   /   1.3' Foreground='#52836A' FontSize='11'/></Border>
+   <Border Grid.Column='2' Background='#EDF6F0' CornerRadius='12' Padding='12,6' VerticalAlignment='Center'><TextBlock Text='●  纯本地运行   /   1.3.5' Foreground='#52836A' FontSize='11'/></Border>
   </Grid>
  </Border>
  <StackPanel Grid.Row='1' Margin='22,14,22,12'>
@@ -145,7 +148,7 @@ namespace CodexZhiru {
     <TabItem Header='导入核对'><Grid Margin='12'>
      <Grid.RowDefinitions><RowDefinition Height='Auto'/><RowDefinition Height='Auto'/><RowDefinition Height='*'/><RowDefinition Height='Auto'/></Grid.RowDefinitions>
      <TextBlock Text='只带入需要更新的对话' FontSize='19' FontWeight='SemiBold'/>
-     <TextBlock x:Name='DiffSummary' Grid.Row='1' Text='点击“一键导入”，选择桌面上的 .czr 备份包。内容相同或本机更新的聊天不会出现在待更新列表。' TextWrapping='Wrap' Margin='0,9,0,15' Foreground='#70867C'/>
+     <TextBlock x:Name='DiffSummary' Grid.Row='1' Text='点击“一键导入”，选择桌面上的 .czr 备份包。内容相同或本机内容更多的聊天不会出现在待更新列表。' TextWrapping='Wrap' Margin='0,9,0,15' Foreground='#70867C'/>
      <Grid Grid.Row='2'><Grid.ColumnDefinitions><ColumnDefinition Width='260'/><ColumnDefinition Width='12'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
       <Border BorderBrush='#DEE7E2' BorderThickness='1' CornerRadius='6' Padding='6'><TreeView x:Name='Differences' BorderThickness='0' ScrollViewer.HorizontalScrollBarVisibility='Disabled'/></Border>
       <Grid Grid.Column='2'><Grid.RowDefinitions><RowDefinition Height='Auto'/><RowDefinition Height='Auto'/><RowDefinition Height='*'/><RowDefinition Height='Auto'/></Grid.RowDefinitions>
@@ -155,7 +158,7 @@ namespace CodexZhiru {
        <WrapPanel Grid.Row='3' Margin='0,9,0,0'><Button x:Name='CompareOlder' Content='更早' Padding='8,4'/><Button x:Name='CompareNewer' Content='后面' Padding='8,4'/><TextBlock x:Name='ComparePage' VerticalAlignment='Center' FontSize='11'/></WrapPanel>
       </Grid>
      </Grid>
-     <StackPanel Grid.Row='3' Margin='0,12,0,0'><TextBlock x:Name='SelectionSummary' Text='尚未核对备份包。' Foreground='#70867C' FontSize='11' TextWrapping='Wrap' Margin='0,0,0,10'/><WrapPanel><Button x:Name='SelectAll' Content='勾选全部可导入项'/><Button x:Name='SelectNone' Content='全部取消'/><Button x:Name='Apply' Content='确认导入所选聊天' Tag='primary' Background='#19785E' Foreground='White' BorderBrush='#19785E' IsEnabled='False'/></WrapPanel></StackPanel>
+     <StackPanel Grid.Row='3' Margin='0,12,0,0'><TextBlock x:Name='SelectionSummary' Text='尚未核对备份包。' Foreground='#70867C' FontSize='11' TextWrapping='Wrap' Margin='0,0,0,10'/><WrapPanel><Button x:Name='BackupPolicy' Content='以备份为准重新核对' IsEnabled='False'/><Button x:Name='SelectAll' Content='勾选全部可导入项'/><Button x:Name='SelectNone' Content='全部取消'/><Button x:Name='Apply' Content='确认导入所选聊天' Tag='primary' Background='#19785E' Foreground='White' BorderBrush='#19785E' IsEnabled='False'/></WrapPanel></StackPanel>
     </Grid></TabItem>
    </TabControl>
   </Border>
@@ -169,7 +172,7 @@ namespace CodexZhiru {
             designMode=args.Length>0&&(args[0].StartsWith("--smoke")||args[0]=="--ui-test");
             if(testPreview!=null&&!designMode) throw new InvalidOperationException("Preview fixture is available only in UI test mode.");
             previewReader=testPreview;
-            Title = "codex智入 1.3 · 离线聊天迁移"; Width = Math.Min(1360,SystemParameters.WorkArea.Width-24); Height = Math.Min(850,SystemParameters.WorkArea.Height-24); MinWidth = Math.Min(1020,Width); MinHeight = Math.Min(650,Height);
+            Title = "codex智入 1.3.5 · 离线聊天迁移"; Width = Math.Min(1360,SystemParameters.WorkArea.Width-24); Height = Math.Min(850,SystemParameters.WorkArea.Height-24); MinWidth = Math.Min(1020,Width); MinHeight = Math.Min(650,Height);
             FontFamily = RichMessage.BodyFont; FontSize = 13;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             if (designMode) { WindowStartupLocation=WindowStartupLocation.Manual; Left=-3000; Top=-3000; ShowInTaskbar=false; }
@@ -182,7 +185,7 @@ namespace CodexZhiru {
             showHelpers=(CheckBox)layout.FindName("ShowHelpers"); compareMessages=(StackPanel)layout.FindName("CompareMessages");
             compareTitle=(TextBlock)layout.FindName("CompareTitle"); compareMeta=(TextBlock)layout.FindName("CompareMeta"); comparePage=(TextBlock)layout.FindName("ComparePage");
             selectionSummary=(TextBlock)layout.FindName("SelectionSummary"); compareSide=(ComboBox)layout.FindName("CompareSide");
-            selectAll=(Button)layout.FindName("SelectAll"); selectNone=(Button)layout.FindName("SelectNone");
+            selectAll=(Button)layout.FindName("SelectAll"); selectNone=(Button)layout.FindName("SelectNone"); backupPolicy=(Button)layout.FindName("BackupPolicy");
             compareOlder=(Button)layout.FindName("CompareOlder"); compareNewer=(Button)layout.FindName("CompareNewer");
             selectNone.ToolTip="取消所有导入勾选，不删除聊天；可以重新勾选。";
             autoClose = (CheckBox)layout.FindName("AutoClose"); includeTools = (CheckBox)layout.FindName("Tools");
@@ -208,12 +211,13 @@ namespace CodexZhiru {
             exportButton.Click += async delegate { await Export(); };
             importButton.Click += async delegate { await Preview(); };
             applyButton.Click += async delegate { await Apply(); };
+            backupPolicy.Click += async delegate { await Replan(); };
             rollbackButton.Click += async delegate { await Rollback(); };
             olderButton.Click += async delegate { if (viewId != null) await LoadConversation(viewHome, viewId, Math.Max(0, messageStart - 60)); };
             newerButton.Click += async delegate { if (viewId != null) await LoadConversation(viewHome, viewId, messageStart + 60); };
             includeTools.Click += async delegate { if (viewId != null) await LoadConversation(viewHome, viewId, -1); };
-            selectAll.Click += delegate { if (!busy) { foreach (Change c in changes) c.Selected=c.Selectable; UpdateSelection(); status.Text="已勾选全部可导入项。"; } };
-            selectNone.Click += delegate { if (!busy) { foreach (Change c in changes) c.Selected=false; UpdateSelection(); status.Text="已全部取消勾选，当前选择 0 条；聊天和备份包均未修改。"; } };
+            selectAll.Click += delegate { if (!busy) { foreach (Change c in changes.Where(c=>!c.Helper)) c.Selected=c.Selectable; UpdateSelection(); status.Text="已勾选全部可导入项。"; } };
+            selectNone.Click += delegate { if (!busy) { foreach (Change c in changes.Where(c=>!c.Helper)) c.Selected=false; UpdateSelection(); status.Text="已全部取消勾选，当前选择 0 条；聊天和备份包均未修改。"; } };
             differences.SelectedItemChanged += async delegate { var node=differences.SelectedItem as TreeViewItem; var change=node==null?null:node.Tag as Change; if(!designMode && !renderingDifferences && change!=null) { compareChange=change; await LoadComparison(-1); } };
             compareSide.SelectionChanged += async delegate { if(compareChange!=null) await LoadComparison(-1); };
             compareOlder.Click += async delegate { await LoadComparison(Math.Max(0,compareStart-60)); };
@@ -382,31 +386,55 @@ namespace CodexZhiru {
             }
         }
         private void UpdateSelection() {
-            if(selectAll==null) return;
-            int eligible=changes.Count(c=>c.Selectable), selected=changes.Count(c=>c.Selectable && c.Selected);
+            if(selectAll==null || syncingSelection) return;
+            syncingSelection=true;
+            try {
+                var parents=changes.Where(c=>!c.Helper&&!String.IsNullOrEmpty(c.Id)).ToDictionary(c=>c.Id);
+                foreach(var helper in changes.Where(c=>c.Helper)) {
+                    Change owner;
+                    helper.Selected=helper.Selectable && helper.OwnerId!=null && parents.TryGetValue(helper.OwnerId,out owner) && owner.Selectable && owner.Selected;
+                }
+            } finally {syncingSelection=false;}
+            backupPolicy.IsEnabled=!busy && reading==0 && token!=null;
+            backupPolicy.Content=preferBackup?"切回保留本机":"以备份为准重新核对";
+            int eligible=changes.Count(c=>!c.Helper && c.Selectable), selected=changes.Count(c=>!c.Helper && c.Selectable && c.Selected);
             selectAll.IsEnabled=!busy && eligible>0 && selected<eligible;
             selectNone.IsEnabled=!busy && selected>0;
             applyButton.IsEnabled=!busy && reading==0 && token!=null && selected>0;
-            selectionSummary.Text=token==null?"请选择一个备份包进行核对。":eligible==0?"没有可导入的变更。相同或本机更新的聊天已经跳过；冲突项可查看内容。":
-                String.Format("已选 {0} / {1} 条可导入记录（含 {2} 条内部助手）。同名附件分别保留，导入失败后可以调整勾选重试。",selected,eligible,changes.Count(c=>c.Selectable && c.Selected && c.Helper));
+            selectionSummary.Text=token==null?"请选择一个备份包进行核对。":eligible==0?"没有可导入的聊天。可查看受阻原因，或确认备份后切换以备份为准。":
+                String.Format("已选 {0} / {1} 条聊天，自动随附 {2} 条内部助手 / 安全审查。取消主聊天勾选时，关联记录也会取消。",selected,eligible,changes.Count(c=>c.Selectable && c.Selected && c.Helper));
+        }
+        private TreeViewItem DifferenceNode(Change change) {
+            var stack=new StackPanel {Width=192,Margin=new Thickness(0,4,0,6)};
+            var header=new DockPanel();
+            if(!change.Helper) {
+                var check=new CheckBox {IsEnabled=!busy&&change.Selectable,Tag=change,Margin=new Thickness(0,2,7,0),VerticalAlignment=VerticalAlignment.Top};
+                changeChecks.Add(check);
+                check.SetBinding(CheckBox.IsCheckedProperty,new Binding("Selected") {Source=change,Mode=BindingMode.TwoWay,UpdateSourceTrigger=UpdateSourceTrigger.PropertyChanged});
+                header.Children.Add(check);
+            }
+            header.Children.Add(new TextBlock {Text=change.Title,TextWrapping=TextWrapping.Wrap,FontWeight=FontWeights.Normal});
+            string note=change.Reason;
+            if(!change.Helper && change.HelperCount>0) note+="\n自动随附 "+change.HelperCount+" 条内部助手 / 安全审查";
+            stack.Children.Add(header);stack.Children.Add(new TextBlock {Text=note,FontSize=11,Foreground=Brushes.Gray,TextWrapping=TextWrapping.Wrap,Margin=new Thickness(change.Helper?0:21,4,0,0)});
+            return new TreeViewItem {Header=stack,Tag=change,ToolTip=change.Title+"\n"+note};
         }
         private void RenderDifferences() {
             renderingDifferences=true; differences.Items.Clear(); changeChecks.Clear();
-            foreach(var group in changes.GroupBy(c=>c.Project)) {
-                var root=new TreeViewItem {Header=group.Key+" · "+group.Count(),IsExpanded=true,FontWeight=FontWeights.SemiBold,Margin=new Thickness(0,5,0,8)};
-                var helpers=new TreeViewItem {Header="内部助手 / 安全审查 · "+group.Count(c=>c.Helper),IsExpanded=false,FontWeight=FontWeights.Normal};
-                foreach(var change in group.OrderBy(c=>c.Helper)) {
-                    var stack=new StackPanel {Width=192,Margin=new Thickness(0,4,0,6)};
-                    var header=new DockPanel();
-                    var check=new CheckBox {IsEnabled=!busy&&change.Selectable,Tag=change,Margin=new Thickness(0,2,7,0),VerticalAlignment=VerticalAlignment.Top};
-                    changeChecks.Add(check);
-                    check.SetBinding(CheckBox.IsCheckedProperty,new Binding("Selected") {Source=change,Mode=BindingMode.TwoWay,UpdateSourceTrigger=UpdateSourceTrigger.PropertyChanged});
-                    header.Children.Add(check); header.Children.Add(new TextBlock {Text=change.Title,TextWrapping=TextWrapping.Wrap,FontWeight=FontWeights.Normal});
-                    stack.Children.Add(header); stack.Children.Add(new TextBlock {Text=change.Reason,FontSize=11,Foreground=Brushes.Gray,TextWrapping=TextWrapping.Wrap,Margin=new Thickness(21,4,0,0)});
-                    var node=new TreeViewItem {Header=stack,Tag=change,ToolTip=change.Title+"\n"+change.Reason};
-                    if(change.Helper) helpers.Items.Add(node); else root.Items.Add(node);
+            var attached=changes.Where(c=>c.Helper).ToLookup(c=>c.OwnerId);
+            foreach(var group in changes.Where(c=>!c.Helper).GroupBy(c=>c.Project)) {
+                var root=new TreeViewItem {Header=group.Key+" · "+group.Count()+" 条聊天",IsExpanded=true,FontWeight=FontWeights.SemiBold,Margin=new Thickness(0,5,0,8)};
+                foreach(var change in group) {
+                    var node=DifferenceNode(change);
+                    var members=attached[change.Id].ToList();
+                    if(members.Count>0) {
+                        var helpers=new TreeViewItem {Header="随聊天导入 · "+members.Count+" 条内部记录",IsExpanded=false,FontWeight=FontWeights.Normal};
+                        foreach(var member in members) helpers.Items.Add(DifferenceNode(member));
+                        node.Items.Add(helpers);
+                    }
+                    root.Items.Add(node);
                 }
-                if(helpers.Items.Count>0) root.Items.Add(helpers); differences.Items.Add(root);
+                differences.Items.Add(root);
             }
             renderingDifferences=false; UpdateSelection();
         }
@@ -470,26 +498,53 @@ namespace CodexZhiru {
                 await PrepareBrowsing();
                 var req = Request("preview"); req["home"] = home; req["bundle"] = dialog.FileName; req["auto_close"] = autoClose.IsChecked == true;
                 var result = await Worker(req); token = S(result,"token"); jobs.Add(token); archiveHome = S(result,"archive_home");
-                changes = Rows(result,"changes").Select(r => new Change { Id=S(r,"id"),Title=S(r,"title"),Project=S(r,"project"),Reason=S(r,"reason"),Selectable=B(r,"selectable"),Selected=B(r,"selectable"),Helper=B(r,"helper"),Status=S(r,"status"),Source=r }).ToList();
+                SetImportPlan(result);
+                Busy(false,"核对完成，尚未写入任何本机聊天");
+                compareChange=changes.FirstOrDefault(c=>!c.Helper && c.Selectable)??changes.FirstOrDefault(c=>!c.Helper)??changes.FirstOrDefault();
+                if(compareChange!=null) await LoadComparison(-1);
+            } catch(Exception ex) { Error(ex); }
+        }
+        private void SetImportPlan(Dictionary<string,object> result) {
+            comparisonRequest++; preferBackup=B(result,"prefer_backup"); archiveHome=S(result,"archive_home");
+                changes = Rows(result,"changes").Select(r => new Change { Id=S(r,"id"),Title=S(r,"title"),Project=S(r,"project"),Reason=S(r,"reason"),Selectable=B(r,"selectable"),Selected=B(r,"selectable"),Helper=B(r,"helper"),OwnerId=S(r,"owner_id"),HelperCount=N(r,"helper_count"),Status=S(r,"status"),Source=r }).ToList();
                 foreach(Change c in changes) c.PropertyChanged += delegate { UpdateSelection(); };
                 RenderDifferences(); tabs.SelectedIndex = 1;
-                diffSummary.Text = String.Format("备份 {0} 条 / 本机 {1} 条。可安全更新 {2} 条；相同跳过 {3} 条，本机较新跳过 {4} 条。冲突和共享历史受阻项不会覆盖。",N(result,"source_chats"),N(result,"local_chats"),N(result,"safe"),N(result,"same"),N(result,"local_newer"));
+                diffSummary.Text = String.Format("备份 {0} 条 / 本机 {1} 条。可选择 {2} 条聊天，内部助手 / 安全审查自动随附。相同记录 {3} 条，本机内容更多 {4} 条；冲突和共享历史受阻项会保留。",N(result,"source_chats"),N(result,"local_chats"),N(result,"safe_chats"),N(result,"same"),N(result,"local_newer"));
                 if(result.ContainsKey("schema")) {
                     var schema=(Dictionary<string,object>)result["schema"];
                     if(!B(schema,"supported")) diffSummary.Text += "\n"+S(schema,"reason");
                     else if(Rows(schema,"differences").Any()) diffSummary.Text += "\n已适配历史数据库的新旧字段差异；较新元数据另存保留，不更改本机数据库结构。";
                 }
                 if (B(result,"new_profile")) diffSummary.Text += " 新目录尚未初始化，导入后需自行启动 Codex 并登录。";
-                Busy(false,"核对完成，尚未写入任何本机聊天");
+            if(preferBackup) diffSummary.Text=String.Format("以备份为准：备份 {0} 条 / 本机 {1} 条。可选择 {2} 条聊天（含相同内容），内部助手 / 安全审查自动随附。冲突及本机内容更多的已选聊天将使用备份版本；本机独有分支的依赖仍受保护。",N(result,"source_chats"),N(result,"local_chats"),N(result,"safe_chats")) + (result.ContainsKey("schema")&&!B((Dictionary<string,object>)result["schema"],"supported")?"\n"+S((Dictionary<string,object>)result["schema"],"reason"):"");
+            if(N(result,"orphan_helpers")>0) diffSummary.Text += "\n另有 "+N(result,"orphan_helpers")+" 条内部记录缺少可确认的所属聊天，未绑定导入；原备份包中仍保留这些记录。";
+            if(B(result,"local_refreshed")) diffSummary.Text += "\n已重新读取本机快照，本次勾选以刷新后的核对结果为准。";
+            UpdateSelection();
+        }
+        private async Task Replan() {
+            if(busy || reading>0 || token==null) return;
+            Busy(true,"按新的导入策略重新核对；尚未写入聊天…");
+            try {
+                if(!await ConfirmOwners()) {Busy(false,"已取消重新核对");return;}
+                await PrepareBrowsing();
+                var req=Request("replan");req["token"]=token;req["prefer_backup"]=!preferBackup;req["auto_close"]=autoClose.IsChecked==true;
+                var result=await Worker(req);SetImportPlan(result);
+                Busy(false,preferBackup?"已选择以备份为准，请检查勾选和替换提示":"已切回保留本机模式");
                 compareChange=changes.FirstOrDefault(c=>!c.Helper && c.Selectable)??changes.FirstOrDefault(c=>!c.Helper)??changes.FirstOrDefault();
                 if(compareChange!=null) await LoadComparison(-1);
-            } catch(Exception ex) { Error(ex); }
+            } catch(Exception ex) {Error(ex);}
         }
+        private string ImportConfirmation(int count) {
+            string related="\n自动随附 "+changes.Count(c=>c.Helper && c.Selected && c.Selectable)+" 条关联内部助手 / 安全审查，无需单独勾选。";
+            if(preferBackup) return "将以备份为准导入 "+count+" 条聊天。"+related+"\n已选的冲突聊天以及本机记录更多的聊天将替换为备份中的版本；本机独有、未勾选的聊天保留。\n写入前会保留本机原记录的完整回滚副本。请确认备份就是你要恢复的版本。";
+            return "将安全导入 "+count+" 条聊天。"+related+"\n本机内容更多和未勾选的聊天保留，登录配置不替换。\n写入前会保留可回滚副本。继续吗？";
+        }
+
         private async Task Apply() {
             if (busy || token == null) return;
-            string[] selected = changes.Where(c => c.Selected && c.Selectable).Select(c => c.Id).ToArray();
+            string[] selected = changes.Where(c => !c.Helper && c.Selected && c.Selectable).Select(c => c.Id).ToArray();
             if (selected.Length == 0) return;
-            if (MessageBox.Show(this,"将安全导入 " + selected.Length + " 条聊天。\n本机较新的内容和未勾选的聊天保留，登录配置不替换。\n写入前会保留可回滚副本。继续吗？","确认导入",MessageBoxButton.OKCancel,MessageBoxImage.Question) != MessageBoxResult.OK) return;
+            if (MessageBox.Show(this,ImportConfirmation(selected.Length),"确认导入",MessageBoxButton.OKCancel,MessageBoxImage.Question) != MessageBoxResult.OK) return;
             Busy(true,"准备导入所选聊天…");
             try {
                 if (!await ConfirmOwners()) { Busy(false,"已取消导入"); return; }
@@ -498,6 +553,9 @@ namespace CodexZhiru {
                 string appliedToken=token; var result = await Worker(req); jobs.Remove(appliedToken); token = null; await DiscardPreview(false);
                 Busy(false,"导入成功，现在可以重新打开 Codex");
                 string compatibility=N(result,"compatibility_rows_preserved")>0?"\n旧版不支持的元数据已另存保留；以后使用新版导入时可恢复。":"";
+                compatibility += N(result,"repaired_previews")>0?"\n已补齐 "+N(result,"repaired_previews")+" 条聊天的列表摘要。":"";
+                if(result.ContainsKey("missing_project_directories") && ((IEnumerable)result["missing_project_directories"]).Cast<object>().Any()) compatibility += "\n部分工作区目录在这台电脑上不存在，请检查项目路径。";
+                compatibility += "\n若 Codex 列表仍看不到，双击工具目录中的 diagnose.cmd 生成只读诊断。";
                 MessageBox.Show(this,String.Format("新增 {0} 条，更新 {1} 条，本机共 {2} 条。\n同名附件已分别保留 {4} 个。{5}\n\n回滚副本：{3}\n\n现在可以重新打开 Codex。",N(result,"added"),N(result,"updated"),N(result,"total"),S(result,"backup"),Rows(result,"renamed_assets").Count(),compatibility),"导入成功",MessageBoxButton.OK,MessageBoxImage.Information);
                 await Refresh();
             } catch(Exception ex) { Error(ex); }
@@ -514,9 +572,9 @@ namespace CodexZhiru {
         }
         private async Task DiscardPreview(bool resetConversation=true) {
             comparisonRequest++;
-            string previous=token; token=null; archiveHome=null; changes=new List<Change>(); differences.Items.Clear(); compareChange=null; compareMessages.Children.Clear(); compareTitle.Text="点选一条聊天查看对话"; compareMeta.Text="左边勾选要导入的聊天，右边直接阅读内容。"; comparePage.Text=""; UpdateSelection();
+            string previous=token; token=null; preferBackup=false; archiveHome=null; changes=new List<Change>(); differences.Items.Clear(); compareChange=null; compareMessages.Children.Clear(); compareTitle.Text="点选一条聊天查看对话"; compareMeta.Text="左边勾选要导入的聊天，右边直接阅读内容。"; comparePage.Text=""; UpdateSelection();
             changeChecks.Clear();
-            diffSummary.Text="点击“一键导入”，选择 .czr 备份包重新核对。相同或本机更新的聊天会跳过。";
+            diffSummary.Text="点击“一键导入”，选择 .czr 备份包重新核对。相同或本机内容更多的聊天会跳过。";
             if(resetConversation) {
             conversationRequest++;
             viewHome=null; viewId=null; messageStart=0; messageTotal=0; messages.Children.Clear(); pageLabel.Text="";

@@ -18,7 +18,9 @@ import zipfile
 ROOT = Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT / 'src'), str(ROOT / 'lib')]
 import offline as o
+import chat_diagnostics as diagnostics
 from test_chat_select import make_home, fork_history, compact_transcript, A, B, C, SEG
+from test_session_io import compressed
 m, s = o.m, o.selection
 
 
@@ -49,6 +51,10 @@ class OfflineTests(unittest.TestCase):
 
     def tearDown(self):
         self.stack.close()
+        # The nested rollback fixture exceeds MAX_PATH on Windows. Cleanup
+        # must address the same owned temporary directory with extended paths.
+        if os.name == 'nt' and not self.temp.name.startswith('\\\\?\\'):
+            self.temp.name = '\\\\?\\' + str(self.root.resolve())
         self.temp.cleanup()
 
     def home(self, name, chats):
@@ -58,6 +64,253 @@ class OfflineTests(unittest.TestCase):
         path = self.root / (name + '.czr')
         o.export_bundle(home, path)
         return path
+
+    def compress_session(self, home, sid, *, explicit_path=False, archived=False):
+        path = home / 'sessions' / ('rollout-' + sid + '.jsonl')
+        target = Path(str(path) + '.zst')
+        if archived:
+            target = home / 'archived_sessions' / target.name
+        target.write_bytes(compressed(path.read_bytes()))
+        path.unlink()
+        if archived or explicit_path:
+            reference = target if explicit_path else target.with_suffix('')
+            with contextlib.closing(sqlite3.connect(home / m.DBS[0])) as db, db:
+                db.execute('UPDATE threads SET rollout_path=?,archived=? WHERE id=?', (str(reference), int(archived), sid))
+        return target
+
+    def bind_helpers(self, home, parents, guardians=()):
+        with contextlib.closing(sqlite3.connect(home / m.DBS[0])) as db, db:
+            if 'thread_source' not in m.cols(db, 'threads'):
+                db.execute('ALTER TABLE threads ADD COLUMN thread_source TEXT')
+            for child, parent in parents.items():
+                db.execute('UPDATE threads SET thread_source=? WHERE id=?',
+                           ('guardian_review' if child in guardians else 'subagent', child))
+                db.execute('INSERT INTO thread_spawn_edges VALUES(?,?,?)', ('spawn-' + child, parent, child))
+        return home
+
+    def test_chat_selection_automatically_imports_nested_helpers_and_edges_then_rolls_back(self):
+        source = self.home('bound-source', {A:['parent'], B:['assistant'], C:['review'], SEG:['independent']})
+        self.bind_helpers(source, {B:A, C:B}, guardians={C})
+        fork_history(source, B, A, 2)
+        fork_history(source, C, B, 4)
+        local = self.bind_helpers(self.home('bound-local', {}), {})
+        before, original = contents(local), contents(source)
+        plan = o.preview_import(self.bundle(source), local)
+        rows = {r['id']:r for r in plan['changes']}
+        self.assertEqual((plan['safe_chats'], plan['safe_helpers']), (2,2))
+        self.assertEqual(rows[A]['helper_count'], 2)
+        self.assertEqual((rows[B]['owner_id'], rows[C]['owner_id']), (A,A))
+        self.assertTrue(rows[C]['guardian'])
+        report = o.apply_import(plan['token'], [A])
+        self.assertEqual((report['selected_chats'], report['selected_helpers']), (1,2))
+        self.assertEqual(set(s.catalog(local)), {A,B,C})
+        self.assertEqual([r['text'] for r in o.conversation(local, C)['messages']], ['parent','assistant','review'])
+        with contextlib.closing(sqlite3.connect(local / m.DBS[0])) as db:
+            self.assertEqual(set(db.execute('SELECT parent_thread_id,child_thread_id FROM thread_spawn_edges')), {(A,B),(B,C)})
+        self.assertEqual(contents(source), original)
+        o.rollback_latest(local)
+        self.assertEqual(contents(local), before)
+
+    def test_helpers_cannot_be_selected_separately_and_follow_only_selected_chat(self):
+        source = self.bind_helpers(self.home('choose-source', {A:['parent'], B:['assistant'], C:['other']}), {B:A})
+        local = self.bind_helpers(self.home('choose-local', {}), {})
+        plan = o.preview_import(self.bundle(source), local)
+        before = contents(local)
+        with self.assertRaisesRegex(ValueError, '不能单独'):
+            o.apply_import(plan['token'], [B])
+        with self.assertRaisesRegex(ValueError, '不能单独'):
+            o.apply_import(plan['token'], [A,B])
+        self.assertEqual(contents(local), before)
+        self.assertTrue(o.apply_import(plan['token'], [])['noop'])
+        o.apply_import(plan['token'], [C])
+        self.assertEqual(set(s.catalog(local)), {C})
+
+    def test_unchanged_chat_is_selectable_when_bound_helper_has_new_content(self):
+        source = self.bind_helpers(self.home('same-parent-source', {A:['same'], B:['one','new']}), {B:A})
+        local = self.bind_helpers(self.home('same-parent-local', {A:['same'], B:['one']}), {B:A})
+        plan = o.preview_import(self.bundle(source), local)
+        self.assertEqual((plan['safe_chats'], plan['safe_helpers']), (1,1))
+        self.assertEqual(next(r['status'] for r in plan['changes'] if r['id']==A), 'same')
+        o.apply_import(plan['token'], [A])
+        self.assertEqual(s.catalog(local), s.catalog(source))
+        again = o.preview_import(self.bundle(source, 'same-again'), local)
+        self.assertEqual(again['safe'], 0)
+        self.assertEqual(again['changes'], [])
+
+    def test_helper_conflict_blocks_whole_chat_until_backup_policy_is_selected(self):
+        source = self.bind_helpers(self.home('conflict-helper-source', {A:['one','new'], B:['backup review']}), {B:A}, {B})
+        local = self.bind_helpers(self.home('conflict-helper-local', {A:['one'], B:['local review'], C:['local only']}), {B:A}, {B})
+        before = contents(local)
+        plan = o.preview_import(self.bundle(source), local)
+        self.assertEqual(plan['safe'], 0)
+        self.assertIn('关联', next(r['reason'] for r in plan['changes'] if r['id']==A))
+        with self.assertRaises(ValueError): o.apply_import(plan['token'], [A])
+        self.assertEqual(contents(local), before)
+        plan = o.replan_import(plan['token'], True)
+        self.assertEqual((plan['safe_chats'], plan['safe_helpers']), (1,1))
+        o.apply_import(plan['token'], [A])
+        self.assertEqual(s.catalog(local)[B], s.catalog(source)[B])
+        self.assertIn(C, s.catalog(local))
+        o.rollback_latest(local)
+        self.assertEqual(contents(local), before)
+
+    def test_helper_history_failure_blocks_owner_as_atomic_group(self):
+        source = self.bind_helpers(self.home('blocked-helper-source', {A:['root'], B:['helper'], C:['source parent']}), {B:A})
+        fork_history(source, B, C, 2)
+        local = self.home('blocked-helper-local', {C:['different parent']})
+        plan = o.preview_import(self.bundle(source), local)
+        root = next(r for r in plan['changes'] if r['id']==A)
+        self.assertFalse(root['selectable'])
+        self.assertIn('关联内部助手受阻', root['reason'])
+        before = contents(local)
+        with self.assertRaises(ValueError): o.apply_import(plan['token'], [A])
+        self.assertEqual(contents(local), before)
+
+    def test_orphan_and_cyclic_helpers_are_not_attached_to_unrelated_chats(self):
+        source = self.bind_helpers(self.home('orphan-source', {A:['root'], B:['helper'], C:['review']}), {B:C, C:B}, {C})
+        local = self.bind_helpers(self.home('orphan-local', {}), {})
+        plan = o.preview_import(self.bundle(source), local)
+        self.assertEqual(plan['orphan_helpers'], 2)
+        self.assertEqual({r['id'] for r in plan['changes']}, {A})
+        o.apply_import(plan['token'], [A])
+        self.assertEqual(set(s.catalog(local)), {A})
+
+    def test_ordinary_fork_keeps_its_own_choice_and_owns_its_helpers(self):
+        source = self.bind_helpers(self.home('fork-helper-source', {A:['parent'], B:['fork'], C:['review']}), {C:B}, {C})
+        fork_history(source, B, A, 2)
+        local = self.bind_helpers(self.home('fork-helper-local', {A:['parent','local continuation']}), {})
+        original = (local/'sessions'/('rollout-'+A+'.jsonl')).read_bytes()
+        plan = o.preview_import(self.bundle(source), local)
+        rows = {r['id']:r for r in plan['changes']}
+        self.assertEqual(rows[C]['owner_id'], B)
+        self.assertEqual(rows[B]['helper_count'], 1)
+        self.assertNotIn(A, rows)
+        o.apply_import(plan['token'], [B])
+        self.assertEqual(set(s.catalog(local)), {A,B,C})
+        self.assertEqual((local/'sessions'/('rollout-'+A+'.jsonl')).read_bytes(), original)
+
+    def test_transcript_source_metadata_can_bind_helper_without_database_edge(self):
+        source = self.home('metadata-helper-source', {A:['root'], B:['helper']})
+        path = source/'sessions'/('rollout-'+B+'.jsonl')
+        lines = path.read_bytes().splitlines(keepends=True)
+        first = json.loads(lines[0])
+        first['payload']['source'] = {'subagent':{'thread_spawn':{'parent_thread_id':A}}}
+        path.write_bytes((json.dumps(first)+'\n').encode()+b''.join(lines[1:]))
+        local = self.home('metadata-helper-local', {})
+        plan = o.preview_import(self.bundle(source), local)
+        self.assertEqual((plan['safe_chats'], plan['safe_helpers']), (1,1))
+        self.assertEqual(next(r['owner_id'] for r in plan['changes'] if r['id']==B), A)
+        o.apply_import(plan['token'], [A])
+        self.assertEqual(set(s.catalog(local)), {A,B})
+
+    def test_guardian_parent_metadata_binds_without_spawn_edge_and_survives_import(self):
+        source = self.home('guardian-metadata-source', {A:['root'], B:['approval']})
+        path = source/'sessions'/('rollout-'+B+'.jsonl')
+        lines = path.read_bytes().splitlines(keepends=True)
+        first = json.loads(lines[0])
+        first['payload'].update(source={'subagent':{'other':'guardian'}}, parent_thread_id=A, thread_source='guardian_review')
+        path.write_bytes((json.dumps(first)+'\n').encode()+b''.join(lines[1:]))
+        local = self.home('guardian-metadata-local', {})
+        plan = o.preview_import(self.bundle(source), local)
+        review = next(r for r in plan['changes'] if r['id']==B)
+        self.assertTrue(review['helper'] and review['guardian'])
+        self.assertEqual(review['owner_id'], A)
+        o.apply_import(plan['token'], [A])
+        review = next(r for r in o.list_chats(local)['chats'] if r['id']==B)
+        self.assertTrue(review['helper'] and review['guardian'])
+        self.assertEqual(review['parent_id'], A)
+
+    def test_local_newer_helper_blocks_group_in_preserve_mode_and_local_only_helpers_remain(self):
+        source = self.bind_helpers(self.home('older-helper-source', {A:['one','new'], B:['approval']}), {B:A}, {B})
+        local = self.bind_helpers(self.home('older-helper-local', {A:['one'], B:['approval','new local'], C:['local only helper']}), {B:A,C:A}, {B,C})
+        original = (local/'sessions'/('rollout-'+C+'.jsonl')).read_bytes()
+        plan = o.preview_import(self.bundle(source), local)
+        self.assertEqual(plan['safe_chats'], 0)
+        plan = o.replan_import(plan['token'], True)
+        o.apply_import(plan['token'], [A])
+        self.assertEqual((local/'sessions'/('rollout-'+C+'.jsonl')).read_bytes(), original)
+        with contextlib.closing(sqlite3.connect(local/m.DBS[0])) as db:
+            self.assertIn((A,C), set(db.execute('SELECT parent_thread_id,child_thread_id FROM thread_spawn_edges')))
+
+    def test_compressed_source_export_preview_import_and_rollback(self):
+        source = self.home('compressed-source', {A:['共享中文'], B:['分支内容'], C:['归档']})
+        fork_history(source, B, A, 2)
+        self.compress_session(source, A)
+        self.compress_session(source, B, explicit_path=True)
+        self.compress_session(source, C, archived=True)
+        before_source = contents(source)
+        self.assertEqual([row['text'] for row in o.conversation(source, B)['messages']], ['共享中文','分支内容'])
+        view = o.prepare_readers(source)
+        self.assertEqual(o.conversation(view['home'], B)['total'], 2)
+        archive = self.bundle(source)
+        with zipfile.ZipFile(archive) as z:
+            for relative, data in before_source.items():
+                if relative.endswith('.jsonl.zst'):
+                    self.assertEqual(z.read('data/' + relative), data)
+        local = self.home('compressed-local', {})
+        before_local = contents(local)
+        preview = o.preview_import(archive, local)
+        self.assertEqual(preview['safe'], 3)
+        result = o.apply_import(preview['token'], [A,B,C])
+        self.assertEqual(result['added'], 3)
+        self.assertEqual(s.catalog(source), s.catalog(local))
+        self.assertEqual(o.conversation(local, B)['total'], 2)
+        self.assertFalse(list(local.rglob('*.jsonl.zst')))
+        self.assertEqual(contents(source), before_source)
+        o.rollback_latest(local)
+        self.assertEqual(contents(local), before_local)
+
+    def test_compressed_target_parent_and_local_only_chat_are_preserved(self):
+        source = self.home('source-compressed-parent', {A:['shared'], B:['child']})
+        fork_history(source, B, A, 2)
+        self.compress_session(source, B)
+        local = self.home('target-compressed-parent', {A:['shared','local continuation'], C:['local only']})
+        parent = self.compress_session(local, A)
+        independent = self.compress_session(local, C, explicit_path=True)
+        before_parent, before_independent = parent.read_bytes(), independent.read_bytes()
+        preview = o.preview_import(self.bundle(source), local)
+        self.assertEqual(preview['local_newer'], 1)
+        o.apply_import(preview['token'], [B])
+        self.assertEqual(parent.read_bytes(), before_parent)
+        self.assertEqual(independent.read_bytes(), before_independent)
+        self.assertEqual([row['text'] for row in o.conversation(local, B)['messages']], ['shared','child'])
+        report = diagnostics.diagnose(local, cache=self.root / 'diagnostic-cache')
+        self.assertEqual(report['counts']['missing_transcript_paths'], 0)
+
+    def test_compressed_corruption_blocks_import_without_target_changes(self):
+        source = self.home('broken-source', {A:['one']})
+        path = self.compress_session(source, A)
+        archive = self.bundle(source)
+        # Make a valid inventory around a damaged frame to test decoder failure,
+        # independently of the existing ZIP hash verification.
+        extracted = self.root / 'broken-extracted'
+        o.verify_bundle(archive, extracted)
+        broken = extracted / path.relative_to(source)
+        broken.write_bytes(broken.read_bytes()[:-1])
+        local = self.home('broken-target', {})
+        before = contents(local)
+        with self.assertRaisesRegex(RuntimeError, '压缩会话'):
+            s.prepare_package(extracted, local, self.root / 'broken-pack')
+        self.assertEqual(contents(local), before)
+
+    def test_updated_compressed_target_and_stale_sibling_are_handled_once(self):
+        source = self.home('update-compressed-source', {A:['one','two']})
+        plain = source / 'sessions' / ('rollout-' + A + '.jsonl')
+        Path(str(plain) + '.zst').write_bytes(b'stale ignored sibling')
+        local = self.home('update-compressed-target', {A:['one'], B:['local only']})
+        old = self.compress_session(local, A)
+        before = contents(local)
+        preview = o.preview_import(self.bundle(source), local)
+        self.assertEqual(preview['safe'], 1)
+        result = o.apply_import(preview['token'], [A])
+        self.assertEqual(result['updated'], 1)
+        self.assertFalse(old.exists())
+        self.assertEqual([row['text'] for row in o.conversation(local, A)['messages']], ['one','two'])
+        helper = Path(result['backup']) / 'chat_merge.py'
+        process = subprocess.run([sys.executable, '-I', '-X', 'utf8', str(helper), '--help'], capture_output=True)
+        self.assertEqual(process.returncode, 0, process.stderr.decode('utf-8', 'replace'))
+        o.rollback_latest(local)
+        self.assertEqual(contents(local), before)
 
     def test_unicode_catalog_project_branch_archive_and_conversation(self):
         home = self.home('source', {A: ['你好'], B: ['分支回答']})
@@ -353,6 +606,106 @@ class OfflineTests(unittest.TestCase):
         o.rollback_latest(local)
         self.assertFalse((local / m.DBS[0]).exists())
 
+    def test_older_backup_import_is_visible_in_preview_filtered_thread_list(self):
+        source = self.home('old-source', {A: ['应在 Codex 列表中出现']})
+        local = self.home('new-target', {B: ['本机已有聊天']})
+        for home in (source, local):
+            with contextlib.closing(sqlite3.connect(home / m.DBS[0])) as db, db:
+                db.execute("ALTER TABLE threads ADD COLUMN first_user_message TEXT NOT NULL DEFAULT ''")
+                db.execute('UPDATE threads SET first_user_message=?', ('应在 Codex 列表中出现',))
+        with contextlib.closing(sqlite3.connect(local / m.DBS[0])) as db, db:
+            db.execute("ALTER TABLE threads ADD COLUMN preview TEXT NOT NULL DEFAULT ''")
+            db.execute('UPDATE threads SET preview=? WHERE id=?', ('本机原有摘要', B))
+        before = contents(local)
+        preview = o.preview_import(self.bundle(source), local)
+        self.assertTrue(preview['schema']['supported'])
+        result = o.apply_import(preview['token'], [A])
+        with contextlib.closing(sqlite3.connect(local / m.DBS[0])) as db:
+            # This is the default active-thread visibility predicate in Codex.
+            visible = dict(db.execute("SELECT id,preview FROM threads WHERE archived=0 AND preview<>''"))
+        self.assertEqual(visible, {A: '应在 Codex 列表中出现', B: '本机原有摘要'})
+        self.assertEqual(result['repaired_previews'], 1)
+        o.rollback_latest(local)
+        self.assertEqual(contents(local), before)
+
+    def test_preview_repair_preserves_nonempty_previews_and_empty_threads(self):
+        home = self.home('repair-target', {A: ['existing hidden'], B: ['already visible'], C: []})
+        with contextlib.closing(sqlite3.connect(home / m.DBS[0])) as db, db:
+            db.execute("ALTER TABLE threads ADD COLUMN first_user_message TEXT NOT NULL DEFAULT ''")
+            db.execute("ALTER TABLE threads ADD COLUMN preview TEXT NOT NULL DEFAULT ''")
+            db.execute('UPDATE threads SET first_user_message=? WHERE id=?', ('first message', A))
+            db.execute('UPDATE threads SET first_user_message=?,preview=? WHERE id=?', ('different', 'keep preview', B))
+        before = contents(home)
+        with contextlib.closing(sqlite3.connect(home / m.DBS[1])) as db:
+            history_before = list(db.iterdump())
+        result = o.repair_previews(home)
+        self.assertEqual(result['repaired_previews'], 1)
+        after = contents(home)
+        self.assertEqual({k: v for k, v in after.items() if k not in m.DBS},
+                         {k: v for k, v in before.items() if k not in m.DBS})
+        with contextlib.closing(sqlite3.connect(home / m.DBS[1])) as db:
+            self.assertEqual(list(db.iterdump()), history_before)
+        with contextlib.closing(sqlite3.connect(home / m.DBS[0])) as db:
+            self.assertEqual(dict(db.execute('SELECT id,preview FROM threads')),
+                             {A: 'first message', B: 'keep preview', C: ''})
+        self.assertTrue(o.repair_previews(home)['noop'])
+        o.rollback_latest(home)
+        self.assertEqual(contents(home), before)
+
+    def test_preview_repair_refuses_running_codex_and_checks_selection(self):
+        home = self.home('running-target', {A: ['one']})
+        before = contents(home)
+        with patch.object(o, 'owners', return_value=[{'pid': 123}]):
+            with self.assertRaisesRegex(RuntimeError, '重新启动'):
+                o.repair_previews(home)
+        self.assertEqual(contents(home), before)
+        with contextlib.closing(sqlite3.connect(':memory:')) as db:
+            db.execute('CREATE TABLE threads(id TEXT PRIMARY KEY,preview TEXT,first_user_message TEXT)')
+            db.executemany('INSERT INTO threads VALUES(?,?,?)', [(A,'','selected'),(B,'','unselected'),(C,'','   ')])
+            self.assertEqual(m.repair_thread_previews(db, {A, C}), 1)
+            self.assertEqual(dict(db.execute('SELECT id,preview FROM threads')), {A:'selected',B:'',C:''})
+
+    def test_diagnostic_reports_invisible_missing_and_absent_without_private_values(self):
+        home = self.home('diagnostic-target', {A: ['private text'], B: ['private title']})
+        source = self.home('diagnostic-source', {A: ['private text'], C: ['absent']})
+        with contextlib.closing(sqlite3.connect(home / m.DBS[0])) as db, db:
+            db.execute("ALTER TABLE threads ADD COLUMN preview TEXT NOT NULL DEFAULT ''")
+            db.execute("ALTER TABLE threads ADD COLUMN first_user_message TEXT NOT NULL DEFAULT ''")
+            db.execute('UPDATE threads SET first_user_message=? WHERE id=?', ('private text', A))
+            db.execute('UPDATE threads SET archived=1,rollout_path=? WHERE id=?', ('Z:/secret-user/missing.jsonl', B))
+        before = contents(home)
+        report = diagnostics.diagnose(home, bundle=self.bundle(source), cache=self.root / 'diagnostic-cache')
+        self.assertEqual(report['counts']['ordinary_active_empty_preview'], 1)
+        self.assertEqual(report['counts']['repairable_previews'], 1)
+        self.assertEqual(report['counts']['missing_transcript_paths'], 1)
+        self.assertEqual(report['bundle_comparison']['absent_from_target'], 1)
+        self.assertEqual(report['bundle_comparison']['present_with_empty_preview'], 1)
+        rendered = json.dumps(report, ensure_ascii=False)
+        for private in (A, B, C, str(home), 'private text', 'private title', 'secret-user'):
+            self.assertNotIn(private, rendered)
+        self.assertEqual(contents(home), before)
+
+    def test_diagnostic_reads_committed_wal_without_touching_source(self):
+        home = self.home('diagnostic-wal', {A: ['one']})
+        with contextlib.closing(sqlite3.connect(home / m.DBS[0])) as db:
+            db.execute('PRAGMA journal_mode=WAL')
+            db.execute('PRAGMA wal_autocheckpoint=0')
+            db.execute("ALTER TABLE threads ADD COLUMN preview TEXT NOT NULL DEFAULT ''")
+            db.commit()
+            before = contents(home)
+            report = diagnostics.diagnose(home, cache=self.root / 'diagnostic-cache')
+            self.assertTrue(report['has_preview_column'])
+            self.assertEqual(report['counts']['active_empty_preview'], 1)
+            self.assertEqual(contents(home), before)
+
+    def test_diagnostic_rejects_changing_snapshot_and_missing_home(self):
+        home = self.home('diagnostic-changing', {A: ['one']})
+        with patch.object(diagnostics, 'file_signature', side_effect=[[(i,)] for i in range(6)]):
+            with self.assertRaisesRegex(RuntimeError, '仍在写入'):
+                diagnostics.diagnose(home, cache=self.root / 'diagnostic-cache')
+        with self.assertRaisesRegex(ValueError, '没有 state_5.sqlite'):
+            diagnostics.diagnose(self.root / 'wrong')
+
     def test_reuse_newer_parent_for_branch_without_overwriting_parent(self):
         source = self.home('source', {A: ['shared'], B: ['child']})
         local = self.home('local', {A: ['shared', 'new local']})
@@ -365,6 +718,195 @@ class OfflineTests(unittest.TestCase):
         o.apply_import(preview['token'], [B])
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual([x['text'] for x in o.conversation(local, B)['messages']], ['shared', 'child'])
+
+    def test_backup_policy_replaces_conflicting_parent_and_restores_source_branches(self):
+        source = self.home('backup-policy-source', {A:['one','backup latest'], B:['child']})
+        fork_history(source, B, A, 3)
+        local = self.home('backup-policy-local', {A:['one','different local'], C:['local independent']})
+        before_source, before_local = contents(source), contents(local)
+        preview = o.preview_import(self.bundle(source), local)
+        self.assertEqual(preview['safe'], 0)
+        self.assertFalse(preview['prefer_backup'])
+        plan = o.replan_import(preview['token'], True)
+        self.assertTrue(plan['prefer_backup'])
+        self.assertEqual({r['id'] for r in plan['changes'] if r['selectable']}, {A,B})
+        self.assertEqual(contents(local), before_local, 'Replanning must remain read-only')
+        with self.assertRaisesRegex(RuntimeError, '父聊天'):
+            o.apply_import(plan['token'], [B])
+        self.assertEqual(contents(local), before_local)
+        result = o.apply_import(plan['token'], [A,B])
+        self.assertEqual([r['text'] for r in o.conversation(local, B)['messages']], ['one','backup latest','child'])
+        self.assertEqual(s.catalog(local)[C]['events'], s.catalog(self.home('independent-check', {C:['local independent']}))[C]['events'])
+        self.assertEqual(contents(source), before_source)
+        self.assertEqual((local/'auth.json').read_bytes(), before_local['auth.json'])
+        journal=m.read_json(Path(result['backup'])/'transaction.json')
+        self.assertEqual(journal['report']['import_policy'], 'backup')
+        o.rollback_latest(local)
+        self.assertEqual(contents(local), before_local)
+
+    def test_backup_policy_can_replace_longer_local_history_and_include_same_relations(self):
+        source = self.home('shorter-backup', {A:['requested backup'], C:['same']})
+        local = self.home('longer-local', {A:['requested backup','local extra'], C:['same']})
+        before=contents(local)
+        preview=o.preview_import(self.bundle(source),local)
+        self.assertEqual(preview['local_newer'],1)
+        plan=o.replan_import(preview['token'],True)
+        self.assertEqual(plan['safe'],2)
+        self.assertIn('本机更多',next(r['reason'] for r in plan['changes'] if r['id']==A))
+        o.apply_import(plan['token'],[A,C])
+        self.assertEqual(s.catalog(source),s.catalog(local))
+        o.rollback_latest(local)
+        self.assertEqual(contents(local),before)
+
+    def test_backup_policy_switching_back_revokes_conflict_selection(self):
+        source=self.home('source-policy-switch',{A:['backup']})
+        local=self.home('local-policy-switch',{A:['local']})
+        preview=o.preview_import(self.bundle(source),local)
+        self.assertEqual(o.replan_import(preview['token'],True)['safe'],1)
+        plan=o.replan_import(preview['token'],False)
+        self.assertFalse(plan['prefer_backup'])
+        self.assertEqual(plan['safe'],0)
+        before=contents(local)
+        with self.assertRaises(ValueError): o.apply_import(plan['token'],[A])
+        self.assertEqual(contents(local),before)
+        with self.assertRaisesRegex(ValueError,'明确选择'): o.replan_import(plan['token'],'backup')
+
+    def test_backup_policy_protects_unselected_local_only_shared_history(self):
+        source=self.home('protected-source',{A:['backup different'], C:['new independent']})
+        local=self.home('protected-local',{A:['local different'], B:['local-only fork']})
+        fork_history(local,B,A,2)
+        original_a=(local/'sessions'/('rollout-'+A+'.jsonl')).read_bytes()
+        original_b=(local/'sessions'/('rollout-'+B+'.jsonl')).read_bytes()
+        preview=o.preview_import(self.bundle(source),local)
+        plan=o.replan_import(preview['token'],True)
+        rows={r['id']:r for r in plan['changes']}
+        self.assertFalse(rows[A]['selectable'])
+        self.assertIn('本机保留的分支',rows[A]['reason'])
+        self.assertTrue(rows[C]['selectable'])
+        o.apply_import(plan['token'],[C])
+        self.assertEqual((local/'sessions'/('rollout-'+A+'.jsonl')).read_bytes(),original_a)
+        self.assertEqual((local/'sessions'/('rollout-'+B+'.jsonl')).read_bytes(),original_b)
+        self.assertEqual([r['text'] for r in o.conversation(local,B)['messages']],['local different','local-only fork'])
+
+    def test_backup_policy_does_not_bypass_schema_compatibility(self):
+        source=self.home('schema-policy-source',{A:['backup']})
+        local=self.home('schema-policy-local',{A:['local']})
+        with contextlib.closing(sqlite3.connect(source/m.DBS[1])) as db,db:
+            db.execute('ALTER TABLE thread_items ADD COLUMN unknown_item_semantics TEXT')
+        preview=o.preview_import(self.bundle(source),local)
+        before=contents(local)
+        plan=o.replan_import(preview['token'],True)
+        self.assertFalse(plan['schema']['supported'])
+        self.assertEqual(plan['safe'],0)
+        with self.assertRaises(ValueError): o.apply_import(plan['token'],[A])
+        self.assertEqual(contents(local),before)
+
+    def test_read_state_copies_committed_wal_without_opening_original(self):
+        home=self.home('read-wal',{A:['one']})
+        with contextlib.closing(sqlite3.connect(home/m.DBS[0])) as writer:
+            writer.execute('PRAGMA journal_mode=WAL')
+            writer.execute('PRAGMA wal_autocheckpoint=0')
+            writer.execute('UPDATE threads SET name=? WHERE id=?',('committed WAL name',A))
+            writer.commit()
+            before=contents(home)
+            original=m.db_open
+            def copies_only(path,*args,**kwargs):
+                self.assertNotEqual(Path(path).resolve().parent,home.resolve())
+                return original(path,*args,**kwargs)
+            with patch.object(m,'db_open',side_effect=copies_only):
+                self.assertEqual(o.list_chats(home)['chats'][0]['title'],'committed WAL name')
+            self.assertEqual(contents(home),before)
+
+    def test_replan_refreshes_real_new_messages_then_can_rollback(self):
+        source=self.home('refresh-source',{A:['one']})
+        local=self.home('refresh-local',{A:['one']})
+        preview=o.preview_import(self.bundle(source),local)
+        path=local/'sessions'/('rollout-'+A+'.jsonl')
+        with path.open('a',encoding='utf-8') as stream:
+            stream.write(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'new local continuation'}})+'\n')
+        before=contents(local)
+        plan=o.replan_import(preview['token'],True)
+        self.assertEqual(plan['local_newer'],1)
+        self.assertEqual(plan['changes'][0]['local_records'],2)
+        self.assertTrue(plan['local_refreshed'])
+        self.assertEqual(contents(local),before)
+        o.apply_import(plan['token'],[A])
+        self.assertEqual(o.conversation(local,A)['total'],1)
+        o.rollback_latest(local)
+        self.assertEqual(contents(local),before)
+
+    def test_failed_replan_keeps_previous_preview_and_can_retry(self):
+        source=self.home('retry-source',{A:['backup']})
+        local=self.home('retry-local',{A:['local']})
+        preview=o.preview_import(self.bundle(source),local)
+        work=o.job_path(preview['token'])
+        previous=(work/'job.json').read_bytes()
+        before=contents(local)
+        original=m.take_current
+        def fail_after_copy(*args,**kwargs):
+            original(*args,**kwargs)
+            raise RuntimeError('isolated snapshot failure')
+        with patch.object(m,'take_current',side_effect=fail_after_copy):
+            with self.assertRaisesRegex(RuntimeError,'snapshot failure'):
+                o.replan_import(preview['token'],True)
+        self.assertEqual((work/'job.json').read_bytes(),previous)
+        self.assertEqual(contents(local),before)
+        self.assertTrue(o.replan_import(preview['token'],True)['prefer_backup'])
+
+    def test_replan_rejects_changes_during_snapshot_and_keeps_previous_plan(self):
+        source=self.home('unstable-source',{A:['backup']})
+        local=self.home('unstable-local',{A:['local']})
+        preview=o.preview_import(self.bundle(source),local)
+        work=o.job_path(preview['token']); previous=(work/'job.json').read_bytes()
+        original=m.take_current
+        def copy_and_change(*args,**kwargs):
+            original(*args,**kwargs)
+            m.write_json(local/'.codex-global-state.json',{'pinned-thread-ids':[A],'changed':'synthetic external writer'})
+        with patch.object(m,'take_current',side_effect=copy_and_change):
+            with self.assertRaisesRegex(RuntimeError,'仍在变化'):
+                o.replan_import(preview['token'],True)
+        self.assertEqual((work/'job.json').read_bytes(),previous)
+
+    def test_refreshed_plan_still_blocks_later_target_changes(self):
+        source=self.home('guard-source',{A:['backup']})
+        local=self.home('guard-local',{A:['local']})
+        preview=o.preview_import(self.bundle(source),local)
+        plan=o.replan_import(preview['token'],True)
+        m.write_json(local/'.codex-global-state.json',{'pinned-thread-ids':[]})
+        before=contents(local)
+        with self.assertRaisesRegex(RuntimeError,'有变化'):
+            o.apply_import(plan['token'],[A])
+        self.assertEqual(contents(local),before)
+
+    def test_browsing_wal_target_does_not_change_source_or_block_backup_policy(self):
+        source=self.home('browse-wal-source',{A:['backup']})
+        local=self.home('browse-wal-local',{A:['local']})
+        with contextlib.closing(sqlite3.connect(local/m.DBS[0])) as db:
+            db.execute('PRAGMA journal_mode=WAL')
+        preview=o.preview_import(self.bundle(source),local)
+        before=contents(local)
+        self.assertEqual(o.conversation(local,A)['messages'][0]['text'],'local')
+        self.assertEqual(contents(local),before,'Browsing must never create/update the source WAL/SHM')
+        self.assertTrue(o.replan_import(preview['token'],True)['prefer_backup'])
+
+    def test_backup_policy_replan_refreshes_model_configuration(self):
+        source=self.home('replan-source',{A:['backup']})
+        local=self.home('replan-local',{A:['local']})
+        preview=o.preview_import(self.bundle(source),local)
+        (local/'config.toml').write_text('model="changed"',encoding='utf-8')
+        before=contents(local)
+        plan=o.replan_import(preview['token'],True)
+        self.assertTrue(plan['local_refreshed'])
+        self.assertEqual(contents(local),before)
+        job=m.read_json(o.job_path(plan['token'])/'job.json')
+        self.assertIn('pack_dir',job)
+        manifest=m.read_json(o.preview_path(o.job_path(plan['token']),job,'pack')/'package.json')
+        self.assertEqual(manifest['model_fallback'],'changed')
+        o.apply_import(plan['token'],[A])
+        self.assertEqual((local/'config.toml').read_bytes(),before['config.toml'])
+        self.assertEqual(o.conversation(local,A)['messages'][0]['text'],'backup')
+        o.rollback_latest(local)
+        self.assertEqual(contents(local),before)
 
     def test_true_conflict_and_incompatible_shared_prefix_are_not_selectable(self):
         source = self.home('source', {A: ['one'], B: ['fork'], C: ['safe']})
@@ -494,7 +1036,8 @@ class OfflineTests(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(home / m.DBS[0])) as db, db:
             db.execute('UPDATE threads SET name=NULL,title=NULL,project_id=NULL WHERE id=?', (B,))
         row = next(r for r in o.list_chats(home)['chats'] if r['id'] == B)
-        self.assertEqual(row['title'], '审阅助手')
+        self.assertEqual(row['title'], '子助手 · 审阅助手')
+        self.assertTrue(row['helper'])
         self.assertEqual(row['project'], '机器人项目')
 
     def test_operation_lock_rejects_parallel_writer(self):
@@ -525,12 +1068,18 @@ class OfflineTests(unittest.TestCase):
 
     def test_worker_protocol_unicode_readonly(self):
         home = self.home('source', {A: ['你好']})
+        with contextlib.closing(sqlite3.connect(home / m.DBS[0])) as db:
+            db.execute('PRAGMA journal_mode=WAL')
+        before = contents(home)
         request = json.dumps({'action': 'list', 'home': str(home)}, ensure_ascii=False).encode('utf-8')
+        environment = os.environ.copy()
+        environment['LOCALAPPDATA'] = str(self.root / 'child-appdata')
         result = subprocess.run([sys.executable, '-I', '-X', 'utf8', str(ROOT / 'src' / 'offline.py')],
-                                input=request, capture_output=True, timeout=30, creationflags=0x08000000)
-        self.assertEqual(result.returncode, 0, result.stderr.decode('utf-8'))
+                                input=request, capture_output=True, timeout=30, creationflags=0x08000000, env=environment)
+        self.assertEqual(result.returncode, 0, result.stderr.decode('utf-8') + result.stdout.decode('utf-8'))
         reply = json.loads(result.stdout.decode('utf-8').strip())
         self.assertEqual(reply['data']['chats'][0]['project'], '机器人项目')
+        self.assertEqual(contents(home), before)
 
     def test_visualization_collision_keeps_both_and_rewrites_incoming_chat(self):
         relative = Path('visualizations') / '2026' / '07' / '10' / B / 'gripper.html'
